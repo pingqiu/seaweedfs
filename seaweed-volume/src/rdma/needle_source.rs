@@ -8,9 +8,7 @@ use crate::rdma::parse_fid::parse_fid;
 use crate::server::volume_server::VolumeServerState;
 use crate::storage::needle::needle::Needle;
 use crate::storage::store::Store;
-use crate::storage::types::{
-    NeedleId, VolumeId, DATA_SIZE_SIZE, NEEDLE_HEADER_SIZE, VERSION_1,
-};
+use crate::storage::types::{NeedleId, VolumeId, VERSION_1};
 
 #[derive(Clone)]
 pub struct StoreNeedleSource {
@@ -42,16 +40,13 @@ pub(crate) fn locate_in_store(store: &Store, id: &str) -> Option<NeedleLocation>
         .read_volume_needle_stream_info(volume_id, &mut needle, false)
         .ok()?;
     let (_, volume) = store.find_volume(volume_id)?;
-    let record_prefix = if volume.version() == VERSION_1 {
-        NEEDLE_HEADER_SIZE
-    } else {
-        NEEDLE_HEADER_SIZE + DATA_SIZE_SIZE
-    };
-    let record_offset = info.data_file_offset.checked_sub(record_prefix as u64)?;
+    if volume.version() == VERSION_1 {
+        return None;
+    }
 
     Some(NeedleLocation {
         volume_id: vid,
-        offset: record_offset,
+        offset: info.data_file_offset,
         length: info.data_size as u64,
         dat_path: Some(volume.file_name(".dat")),
     })
@@ -64,10 +59,33 @@ mod tests {
     use crate::storage::needle::needle::Needle;
     use crate::storage::needle_map::NeedleMapKind;
     use crate::storage::store::Store;
-    use crate::storage::types::{
-        Cookie, DiskType, NeedleId, Version, VolumeId, DATA_SIZE_SIZE, NEEDLE_HEADER_SIZE,
-    };
+    use crate::storage::types::{Cookie, DiskType, NeedleId, Version, VolumeId};
+    use std::fs::File;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, offset)
+    }
+
+    #[cfg(windows)]
+    fn read_exact_at(file: &File, buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+        use std::os::windows::fs::FileExt;
+        let mut filled = 0;
+        while filled < buf.len() {
+            let n = file.seek_read(&mut buf[filled..], offset)?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF in seek_read",
+                ));
+            }
+            filled += n;
+            offset += n as u64;
+        }
+        Ok(())
+    }
 
     fn make_store_with_needle(data: &[u8], cookie: u32) -> (TempDir, Store, String) {
         let tmp = TempDir::new().unwrap();
@@ -104,7 +122,7 @@ mod tests {
         };
         store.write_volume_needle(VolumeId(3), &mut needle).unwrap();
 
-        let fid = format!("3,{:x}{:08x}", 1u64, cookie);
+        let fid = format!("3,{:02x}{:08x}", 1u64, cookie);
         (tmp, store, fid)
     }
 
@@ -126,10 +144,19 @@ mod tests {
         let info = store
             .read_volume_needle_stream_info(VolumeId(3), &mut needle, false)
             .unwrap();
-        assert_eq!(
-            loc.offset + (NEEDLE_HEADER_SIZE + DATA_SIZE_SIZE) as u64,
-            info.data_file_offset
-        );
+        assert_eq!(loc.offset, info.data_file_offset);
+    }
+
+    #[test]
+    fn locate_offset_points_at_payload_bytes_not_record_header() {
+        let (_tmp, store, fid) = make_store_with_needle(b"hello rdma", 0x89b26a98);
+
+        let loc = locate_in_store(&store, &fid).unwrap();
+        let file = File::open(loc.dat_path.as_deref().unwrap()).unwrap();
+        let mut payload = vec![0u8; loc.length as usize];
+        read_exact_at(&file, &mut payload, loc.offset).unwrap();
+
+        assert_eq!(payload, b"hello rdma");
     }
 
     #[test]
@@ -141,6 +168,6 @@ mod tests {
     #[test]
     fn locate_missing_key_returns_none() {
         let (_tmp, store, _fid) = make_store_with_needle(b"hello rdma", 0x89b26a98);
-        assert!(locate_in_store(&store, "3,289b26a98").is_none());
+        assert!(locate_in_store(&store, "3,0289b26a98").is_none());
     }
 }

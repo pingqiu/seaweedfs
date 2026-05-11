@@ -5,8 +5,10 @@
 //! TCP/mock-test capable without requiring libibverbs; the `rdma` feature
 //! enables real RDMA through the substrate.
 
+pub mod listener;
 pub mod needle_source;
 pub mod parse_fid;
 
+pub use listener::{BoundListener, Listener, ListenerConfig};
 pub use needle_source::StoreNeedleSource;
 pub use parse_fid::{parse_fid, ParseFidError};
