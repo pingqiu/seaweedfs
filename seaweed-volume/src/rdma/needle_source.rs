@@ -367,7 +367,8 @@ mod tests {
     use crate::storage::needle_map::NeedleMapKind;
     use crate::storage::store::Store;
     use crate::storage::types::{Cookie, DiskType, NeedleId, Version, VolumeId};
-    use seaweed_rdma::{RdmaReadError, RdmaReadableSource};
+    use seaweed_rdma::buffer_pool::{BufferPool, BufferPoolConfig};
+    use seaweed_rdma::{RdmaReadError, RdmaReadableSource, SlotReader};
     use std::fs::File;
     use std::sync::{Arc, RwLock};
     use tempfile::TempDir;
@@ -492,6 +493,45 @@ mod tests {
         assert_eq!(handle.len(), 10);
         assert_eq!(handle.cookie(), 0x89b26a98);
         assert_eq!(payload, b"rdma");
+    }
+
+    #[test]
+    fn store_read_handle_fills_rdma_buffer_slots() {
+        let (_tmp, store, fid) = make_store_with_needle(b"abcdefghijklmnopqrstuvwxyz", 0x89b26a98);
+        let source = StoreNeedleSource::from_store_for_tests(Arc::new(RwLock::new(store)));
+        let mut handle = source.open(&fid).unwrap();
+        let pool = Arc::new(BufferPool::new(BufferPoolConfig {
+            size_bytes: 32,
+            slot_size: 8,
+            aligned: false,
+            prefer_hugepage: false,
+        }));
+        let reader = SlotReader::new(pool.clone());
+
+        let batch = reader
+            .read_handle_to_slots(7, handle.as_mut(), 5, 17)
+            .unwrap();
+        let segments = batch.segments();
+
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0].request_offset, 0);
+        assert_eq!(segments[0].length, 8);
+        assert_eq!(segments[1].request_offset, 8);
+        assert_eq!(segments[1].length, 8);
+        assert_eq!(segments[2].request_offset, 16);
+        assert_eq!(segments[2].length, 1);
+
+        let mut payload = Vec::new();
+        for segment in segments {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(segment.slot.ptr as *const u8, segment.length)
+            };
+            payload.extend_from_slice(bytes);
+        }
+        assert_eq!(payload, b"fghijklmnopqrstuv");
+
+        assert_eq!(batch.deallocate(), 3);
+        assert_eq!(pool.stats().allocated_slots, 0);
     }
 
     #[test]
