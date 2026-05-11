@@ -6,7 +6,8 @@ use seaweed_rdma::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{broadcast, Semaphore};
+use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use crate::rdma::parse_fid::parse_fid;
@@ -67,23 +68,46 @@ pub struct BoundListener<S: RdmaReadableSource + Send + Sync + 'static> {
 
 impl<S: RdmaReadableSource + Send + Sync + 'static> BoundListener<S> {
     pub async fn serve(self) {
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        self.serve_until(shutdown_rx).await;
+        drop(shutdown_tx);
+    }
+
+    pub async fn serve_until(self, mut shutdown: broadcast::Receiver<()>) {
+        let (connection_shutdown_tx, _) = broadcast::channel(1);
+        let mut connections = JoinSet::new();
         loop {
-            match self.tcp.accept().await {
-                Ok((stream, peer)) => {
-                    let source = self.source.clone();
-                    let inflight = self.inflight.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, source, inflight).await {
-                            warn!(error = %e, peer = %peer, "RDMA TCP session ended");
-                        }
-                    });
+            tokio::select! {
+                _ = shutdown.recv() => {
+                    info!("RDMA TCP listener shutting down");
+                    let _ = connection_shutdown_tx.send(());
+                    break;
                 }
-                Err(e) => {
-                    error!(error = %e, "RDMA TCP accept failed");
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                accepted = self.tcp.accept() => match accepted {
+                    Ok((stream, peer)) => {
+                        let source = self.source.clone();
+                        let inflight = self.inflight.clone();
+                        let connection_shutdown = connection_shutdown_tx.subscribe();
+                        connections.spawn(async move {
+                            if let Err(e) = handle_connection(stream, source, inflight, connection_shutdown).await {
+                                warn!(error = %e, peer = %peer, "RDMA TCP session ended");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        error!(error = %e, "RDMA TCP accept failed");
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                },
+                joined = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(e)) = joined {
+                        warn!(error = %e, "RDMA TCP session task failed");
+                    }
                 }
             }
         }
+
+        while connections.join_next().await.is_some() {}
     }
 }
 
@@ -91,13 +115,17 @@ async fn handle_connection<S: RdmaReadableSource + Send + Sync + 'static>(
     mut stream: TcpStream,
     source: Arc<S>,
     inflight: Arc<Semaphore>,
+    mut shutdown: broadcast::Receiver<()>,
 ) -> std::io::Result<()> {
     let mut req_buf = [0u8; REQUEST_WIRE_SIZE];
     loop {
-        match stream.read_exact(&mut req_buf).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(e) => return Err(e),
+        tokio::select! {
+            _ = shutdown.recv() => return Ok(()),
+            read = stream.read_exact(&mut req_buf) => match read {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(e) => return Err(e),
+            }
         }
 
         let req = match RdmaReadRequest::from_bytes(&req_buf) {
@@ -109,18 +137,23 @@ async fn handle_connection<S: RdmaReadableSource + Send + Sync + 'static>(
             Ok(permit) => permit,
             Err(_) => {
                 let resp = RdmaReadResponse::busy(request_id);
-                stream.write_all(resp.as_bytes()).await?;
+                tokio::select! {
+                    _ = shutdown.recv() => return Ok(()),
+                    written = stream.write_all(resp.as_bytes()) => written?,
+                }
                 continue;
             }
         };
 
-        let result = process_request(source.clone(), req).await;
-        write_request_result(&mut stream, request_id, result).await?;
+        let result = process_request(source.clone(), req);
+        tokio::select! {
+            _ = shutdown.recv() => return Ok(()),
+            written = write_request_result(&mut stream, request_id, result) => written?,
+        }
         drop(permit);
     }
 }
-
-async fn process_request<S: RdmaReadableSource + Send + Sync + 'static>(
+fn process_request<S: RdmaReadableSource + Send + Sync + 'static>(
     source: Arc<S>,
     req: RdmaReadRequest,
 ) -> Result<Vec<u8>, ReadFailure> {
@@ -135,9 +168,7 @@ async fn process_request<S: RdmaReadableSource + Send + Sync + 'static>(
         });
     }
 
-    tokio::task::spawn_blocking(move || read_payload(handle, req.offset, req.length))
-        .await
-        .map_err(|e| ReadFailure::Error(e.to_string()))?
+    read_payload(handle, req.offset, req.length)
 }
 
 fn read_payload(
@@ -208,7 +239,6 @@ enum ReadFailure {
     Open(RdmaOpenError),
     Read(RdmaReadError),
     CookieMismatch { expected: u32, actual: u32 },
-    Error(String),
 }
 
 impl std::fmt::Display for ReadFailure {
@@ -223,7 +253,6 @@ impl std::fmt::Display for ReadFailure {
                     "cookie mismatch expected={expected:#x} actual={actual:#x}"
                 )
             }
-            ReadFailure::Error(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -241,6 +270,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
+    use tokio::sync::broadcast;
 
     use super::{Listener, ListenerConfig};
     use crate::config::MinFreeSpace;
@@ -302,6 +332,31 @@ mod tests {
         let addr = bound.bound;
         tokio::spawn(bound.serve());
         addr
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn listener_shutdown_aborts_open_connection_tasks() {
+        let (_tmp, store, _fid) = make_store_with_needle(b"abcdefgh", 0x89b26a98);
+        let source = Arc::new(StoreNeedleSource::from_store_for_tests(store));
+        let listener = Listener::new(
+            source,
+            ListenerConfig {
+                addr: "127.0.0.1:0".to_string(),
+                max_inflight: 8,
+            },
+        );
+        let bound = listener.bind().await.unwrap();
+        let addr = bound.bound;
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let serve_task = tokio::spawn(bound.serve_until(shutdown_rx));
+
+        let _stream = TcpStream::connect(addr).await.unwrap();
+        shutdown_tx.send(()).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), serve_task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     async fn send_request(

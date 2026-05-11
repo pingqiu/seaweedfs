@@ -168,6 +168,8 @@ mod tests {
             tls_policy: TlsPolicy::default(),
             enable_write_queue: false,
             security_file: String::new(),
+            rdma_listen: String::new(),
+            rdma_max_inflight: 256,
         }
     }
 

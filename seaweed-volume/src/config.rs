@@ -191,6 +191,14 @@ pub struct Cli {
     /// A file of command line options, each line in optionName=optionValue format.
     #[arg(long = "options", default_value = "")]
     pub options: String,
+
+    /// RDMA read listener address. Empty disables the RDMA listener.
+    #[arg(long = "rdma-listen", default_value = "")]
+    pub rdma_listen: String,
+
+    /// Maximum concurrent RDMA read requests.
+    #[arg(long = "rdma-max-inflight", default_value = "256")]
+    pub rdma_max_inflight: std::num::NonZeroUsize,
 }
 
 /// Resolved configuration after applying defaults and validation.
@@ -258,6 +266,10 @@ pub struct VolumeServerConfig {
     pub enable_write_queue: bool,
     /// Path to security.toml — stored for SIGHUP reload.
     pub security_file: String,
+    /// RDMA read listener address. Empty disables the RDMA listener.
+    pub rdma_listen: String,
+    /// Maximum concurrent RDMA read requests.
+    pub rdma_max_inflight: usize,
 }
 
 pub use crate::storage::needle_map::NeedleMapKind;
@@ -804,6 +816,8 @@ fn resolve_config(cli: Cli) -> VolumeServerConfig {
             .map(|v| v == "1" || v == "true")
             .unwrap_or(false),
         security_file: cli.security_file,
+        rdma_listen: cli.rdma_listen,
+        rdma_max_inflight: cli.rdma_max_inflight.get(),
     }
 }
 
@@ -1393,6 +1407,64 @@ mod tests {
             let cfg = resolve_config(Cli::parse_from(["bin", "--index", input]));
             assert_eq!(cfg.index_type, expected, "input={}", input);
         }
+    }
+
+    #[test]
+    fn test_resolve_config_parses_rdma_listener_flags() {
+        let cfg = resolve_config(Cli::parse_from([
+            "bin",
+            "--rdma-listen",
+            "127.0.0.1:18515",
+            "--rdma-max-inflight",
+            "32",
+        ]));
+        assert_eq!(cfg.rdma_listen, "127.0.0.1:18515");
+        assert_eq!(cfg.rdma_max_inflight, 32);
+    }
+
+    #[test]
+    fn test_rdma_max_inflight_rejects_zero() {
+        assert!(Cli::try_parse_from(["bin", "--rdma-max-inflight", "0"]).is_err());
+    }
+
+    #[test]
+    fn test_normalize_args_accepts_single_dash_rdma_flags() {
+        let args = vec![
+            "bin".into(),
+            "-rdma-listen".into(),
+            "127.0.0.1:18515".into(),
+            "-rdma-max-inflight=8".into(),
+        ];
+        let norm = normalize_args_vec(args);
+        assert_eq!(
+            norm,
+            vec![
+                "bin",
+                "--rdma-listen",
+                "127.0.0.1:18515",
+                "--rdma-max-inflight=8",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_options_file_parses_rdma_flags_and_cli_precedence() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "rdma-listen=127.0.0.1:18515\nrdma-max-inflight=64\n",
+        )
+        .unwrap();
+        let args = normalize_args_vec(vec![
+            "bin".into(),
+            "--options".into(),
+            tmp.path().to_string_lossy().into_owned(),
+            "--rdma-max-inflight".into(),
+            "8".into(),
+        ]);
+        let cfg = resolve_config(Cli::parse_from(merge_options_file(args)));
+        assert_eq!(cfg.rdma_listen, "127.0.0.1:18515");
+        assert_eq!(cfg.rdma_max_inflight, 8);
     }
 
     #[test]
