@@ -2,29 +2,278 @@
 
 use std::sync::Arc;
 
-use seaweed_rdma::{NeedleLocation, NeedleSource};
+use seaweed_rdma::{
+    NeedleLocation, NeedleSource, RdmaOpenError, RdmaReadError, RdmaReadHandle, RdmaReadableSource,
+};
 
 use crate::rdma::parse_fid::parse_fid;
 use crate::server::volume_server::VolumeServerState;
 use crate::storage::needle::needle::Needle;
 use crate::storage::store::Store;
 use crate::storage::types::{NeedleId, VolumeId, VERSION_1};
+use crate::storage::volume::{NeedleStreamInfo, NeedleStreamSource, VolumeError};
 
 #[derive(Clone)]
 pub struct StoreNeedleSource {
-    state: Arc<VolumeServerState>,
+    access: StoreAccess,
+}
+
+#[derive(Clone)]
+enum StoreAccess {
+    VolumeServer(Arc<VolumeServerState>),
+    #[cfg(test)]
+    Direct(Arc<std::sync::RwLock<Store>>),
 }
 
 impl StoreNeedleSource {
     pub fn new(state: Arc<VolumeServerState>) -> Self {
-        Self { state }
+        Self {
+            access: StoreAccess::VolumeServer(state),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_store_for_tests(store: Arc<std::sync::RwLock<Store>>) -> Self {
+        Self {
+            access: StoreAccess::Direct(store),
+        }
     }
 }
 
 impl NeedleSource for StoreNeedleSource {
     fn locate(&self, id: &str) -> Option<NeedleLocation> {
-        let store = self.state.store.read().ok()?;
-        locate_in_store(&store, id)
+        self.access
+            .with_read_option(|store| locate_in_store(store, id))
+    }
+}
+
+impl RdmaReadableSource for StoreNeedleSource {
+    fn open(&self, id: &str) -> Result<Box<dyn RdmaReadHandle>, RdmaOpenError> {
+        let (vid, needle_id, _cookie) = parse_fid(id).map_err(|_| RdmaOpenError::NotFound)?;
+        let volume_id = VolumeId(vid);
+        let needle_id = NeedleId(needle_id);
+        let access = self.access.clone();
+        let handle = access.with_read_open(|store| {
+            RustVolumeReadHandle::open_from_store(access.clone(), store, volume_id, needle_id)
+        })?;
+        Ok(Box::new(handle))
+    }
+}
+
+impl StoreAccess {
+    fn with_read_option<T>(&self, f: impl FnOnce(&Store) -> Option<T>) -> Option<T> {
+        match self {
+            StoreAccess::VolumeServer(state) => {
+                let store = state.store.read().ok()?;
+                f(&store)
+            }
+            #[cfg(test)]
+            StoreAccess::Direct(store) => {
+                let store = store.read().ok()?;
+                f(&store)
+            }
+        }
+    }
+
+    fn with_read_open<T>(
+        &self,
+        f: impl FnOnce(&Store) -> Result<T, RdmaOpenError>,
+    ) -> Result<T, RdmaOpenError> {
+        match self {
+            StoreAccess::VolumeServer(state) => {
+                let store = state
+                    .store
+                    .read()
+                    .map_err(|_| RdmaOpenError::Other("store read lock poisoned".to_string()))?;
+                f(&store)
+            }
+            #[cfg(test)]
+            StoreAccess::Direct(store) => {
+                let store = store
+                    .read()
+                    .map_err(|_| RdmaOpenError::Other("store read lock poisoned".to_string()))?;
+                f(&store)
+            }
+        }
+    }
+
+    fn with_read<T>(
+        &self,
+        f: impl FnOnce(&Store) -> Result<T, RdmaReadError>,
+    ) -> Result<T, RdmaReadError> {
+        match self {
+            StoreAccess::VolumeServer(state) => {
+                let store = state
+                    .store
+                    .read()
+                    .map_err(|_| RdmaReadError::Other("store read lock poisoned".to_string()))?;
+                f(&store)
+            }
+            #[cfg(test)]
+            StoreAccess::Direct(store) => {
+                let store = store
+                    .read()
+                    .map_err(|_| RdmaReadError::Other("store read lock poisoned".to_string()))?;
+                f(&store)
+            }
+        }
+    }
+}
+
+struct RustVolumeReadHandle {
+    access: StoreAccess,
+    source: Option<NeedleStreamSource>,
+    volume_id: VolumeId,
+    needle_id: NeedleId,
+    data_file_offset: u64,
+    data_size: u64,
+    cookie: u32,
+    compaction_revision: u16,
+}
+
+impl RustVolumeReadHandle {
+    fn open_from_store(
+        access: StoreAccess,
+        store: &Store,
+        volume_id: VolumeId,
+        needle_id: NeedleId,
+    ) -> Result<Self, RdmaOpenError> {
+        let mut handle = Self {
+            access,
+            source: None,
+            volume_id,
+            needle_id,
+            data_file_offset: 0,
+            data_size: 0,
+            cookie: 0,
+            compaction_revision: 0,
+        };
+        handle
+            .refresh_from_store(store)
+            .map_err(read_to_open_error)?;
+        Ok(handle)
+    }
+
+    fn refresh_from_store(&mut self, store: &Store) -> Result<(), RdmaReadError> {
+        let (_, volume) = store
+            .find_volume(self.volume_id)
+            .ok_or(RdmaReadError::NotFound)?;
+        if volume.version() == VERSION_1 {
+            return Err(RdmaReadError::Unsupported(
+                "VERSION_1 volumes are not supported by RDMA read handle".to_string(),
+            ));
+        }
+
+        let mut needle = Needle {
+            id: self.needle_id,
+            ..Needle::default()
+        };
+        let info = store
+            .read_volume_needle_stream_info(self.volume_id, &mut needle, false)
+            .map_err(read_error_from_volume)?;
+        self.apply_stream_info(info, needle.cookie.0);
+        Ok(())
+    }
+
+    fn apply_stream_info(&mut self, info: NeedleStreamInfo, cookie: u32) {
+        self.source = Some(info.source);
+        self.volume_id = info.volume_id;
+        self.needle_id = info.needle_id;
+        self.data_file_offset = info.data_file_offset;
+        self.data_size = info.data_size as u64;
+        self.cookie = cookie;
+        self.compaction_revision = info.compaction_revision;
+    }
+
+    fn refresh_for_read(
+        &mut self,
+        store: &Store,
+        expected_cookie: u32,
+    ) -> Result<crate::storage::volume::DataFileReadLease, RdmaReadError> {
+        let (_, volume) = store
+            .find_volume(self.volume_id)
+            .ok_or(RdmaReadError::NotFound)?;
+        if volume.version() == VERSION_1 {
+            return Err(RdmaReadError::Unsupported(
+                "VERSION_1 volumes are not supported by RDMA read handle".to_string(),
+            ));
+        }
+
+        let mut needle = Needle {
+            id: self.needle_id,
+            ..Needle::default()
+        };
+        let (info, lease) = store
+            .read_volume_needle_stream_info_with_lease(self.volume_id, &mut needle, false)
+            .map_err(read_error_from_volume)?;
+        if needle.cookie.0 != expected_cookie {
+            return Err(RdmaReadError::CookieMismatch {
+                expected: expected_cookie,
+                actual: needle.cookie.0,
+            });
+        }
+        self.apply_stream_info(info, needle.cookie.0);
+        Ok(lease)
+    }
+
+    fn read_with_current_source(&self, offset: u64, buf: &mut [u8]) -> Result<(), RdmaReadError> {
+        let source = self
+            .source
+            .as_ref()
+            .ok_or_else(|| RdmaReadError::Other("read handle has no stream source".to_string()))?;
+        let physical_offset = self
+            .data_file_offset
+            .checked_add(offset)
+            .ok_or_else(|| RdmaReadError::Other("physical offset overflow".to_string()))?;
+        source
+            .read_exact_at(buf, physical_offset)
+            .map_err(RdmaReadError::Io)
+    }
+}
+
+impl RdmaReadHandle for RustVolumeReadHandle {
+    fn len(&self) -> u64 {
+        self.data_size
+    }
+
+    fn cookie(&self) -> u32 {
+        self.cookie
+    }
+
+    fn read_exact_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), RdmaReadError> {
+        let requested = buf.len() as u64;
+        let access = self.access.clone();
+        access.with_read(|store| {
+            // Lock order matches storage: store read guard first, then
+            // data-file read lease. Holding both through the read blocks
+            // compaction commit and writers without inverting the writer path.
+            let _lease = self.refresh_for_read(store, self.cookie)?;
+            validate_range(self.data_size, offset, requested)?;
+            self.read_with_current_source(offset, buf)
+        })
+    }
+
+    fn read_at(
+        &mut self,
+        offset: u64,
+        length: u64,
+        max_len: usize,
+    ) -> Result<Vec<u8>, RdmaReadError> {
+        let access = self.access.clone();
+        access.with_read(|store| {
+            // Refresh before resolving `length=0` so same-cookie overwrites
+            // between open and read use the current payload length.
+            let _lease = self.refresh_for_read(store, self.cookie)?;
+            let read_len = resolve_read_len(self.data_size, offset, length)?;
+            if read_len > max_len as u64 {
+                return Err(RdmaReadError::Other(format!(
+                    "requested read exceeds max_len: {read_len}"
+                )));
+            }
+            let mut buf = vec![0u8; read_len as usize];
+            self.read_with_current_source(offset, &mut buf)?;
+            Ok(buf)
+        })
     }
 }
 
@@ -52,15 +301,75 @@ pub(crate) fn locate_in_store(store: &Store, id: &str) -> Option<NeedleLocation>
     })
 }
 
+fn validate_range(len: u64, offset: u64, requested: u64) -> Result<(), RdmaReadError> {
+    let _ = resolve_read_len(len, offset, requested)?;
+    Ok(())
+}
+
+fn resolve_read_len(len: u64, offset: u64, requested: u64) -> Result<u64, RdmaReadError> {
+    if len == 0 || offset >= len {
+        return Err(RdmaReadError::RangeInvalid {
+            len,
+            offset,
+            requested,
+        });
+    }
+    if requested == 0 {
+        return Ok(len - offset);
+    }
+    if offset
+        .checked_add(requested)
+        .map(|end| end <= len)
+        .unwrap_or(false)
+    {
+        Ok(requested)
+    } else {
+        Err(RdmaReadError::RangeInvalid {
+            len,
+            offset,
+            requested,
+        })
+    }
+}
+
+fn read_error_from_volume(err: VolumeError) -> RdmaReadError {
+    match err {
+        VolumeError::NotFound | VolumeError::Deleted => RdmaReadError::NotFound,
+        VolumeError::UnsupportedVersion(version) => {
+            RdmaReadError::Unsupported(format!("unsupported volume version {version}"))
+        }
+        VolumeError::StreamingUnsupported => {
+            RdmaReadError::Unsupported("volume cannot provide a streaming source".to_string())
+        }
+        VolumeError::CookieMismatch(actual) => RdmaReadError::CookieMismatch {
+            expected: 0,
+            actual,
+        },
+        VolumeError::Io(e) => RdmaReadError::Io(e),
+        other => RdmaReadError::Other(other.to_string()),
+    }
+}
+
+fn read_to_open_error(err: RdmaReadError) -> RdmaOpenError {
+    match err {
+        RdmaReadError::NotFound => RdmaOpenError::NotFound,
+        RdmaReadError::Unsupported(msg) => RdmaOpenError::Unsupported(msg),
+        RdmaReadError::Io(e) => RdmaOpenError::Other(e.to_string()),
+        other => RdmaOpenError::Other(other.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::locate_in_store;
+    use super::{locate_in_store, StoreNeedleSource};
     use crate::config::MinFreeSpace;
     use crate::storage::needle::needle::Needle;
     use crate::storage::needle_map::NeedleMapKind;
     use crate::storage::store::Store;
     use crate::storage::types::{Cookie, DiskType, NeedleId, Version, VolumeId};
+    use seaweed_rdma::{RdmaReadError, RdmaReadableSource};
     use std::fs::File;
+    use std::sync::{Arc, RwLock};
     use tempfile::TempDir;
 
     #[cfg(unix)]
@@ -169,5 +478,92 @@ mod tests {
     fn locate_missing_key_returns_none() {
         let (_tmp, store, _fid) = make_store_with_needle(b"hello rdma", 0x89b26a98);
         assert!(locate_in_store(&store, "3,0289b26a98").is_none());
+    }
+
+    #[test]
+    fn read_handle_reports_cookie_and_serves_payload_offset() {
+        let (_tmp, store, fid) = make_store_with_needle(b"hello rdma", 0x89b26a98);
+        let source = StoreNeedleSource::from_store_for_tests(Arc::new(RwLock::new(store)));
+
+        let mut handle = source.open(&fid).unwrap();
+        let mut payload = vec![0u8; 4];
+        handle.read_exact_at(6, &mut payload).unwrap();
+
+        assert_eq!(handle.len(), 10);
+        assert_eq!(handle.cookie(), 0x89b26a98);
+        assert_eq!(payload, b"rdma");
+    }
+
+    #[test]
+    fn read_handle_rejects_out_of_range_read() {
+        let (_tmp, store, fid) = make_store_with_needle(b"hello rdma", 0x89b26a98);
+        let source = StoreNeedleSource::from_store_for_tests(Arc::new(RwLock::new(store)));
+
+        let mut handle = source.open(&fid).unwrap();
+        let mut payload = vec![0u8; 4];
+        let err = handle.read_exact_at(8, &mut payload).unwrap_err();
+
+        assert!(matches!(
+            err,
+            RdmaReadError::RangeInvalid {
+                len: 10,
+                offset: 8,
+                requested: 4
+            }
+        ));
+    }
+
+    #[test]
+    fn open_read_handle_does_not_block_concurrent_store_write() {
+        let (_tmp, store, fid) = make_store_with_needle(b"hello rdma", 0x89b26a98);
+        let store = Arc::new(RwLock::new(store));
+        let source = StoreNeedleSource::from_store_for_tests(store.clone());
+        let _handle = source.open(&fid).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let result = {
+                let mut store = store.write().unwrap();
+                let mut needle = Needle {
+                    id: NeedleId(2),
+                    cookie: Cookie(0x01020304),
+                    data: b"second".to_vec(),
+                    data_size: 6,
+                    ..Needle::default()
+                };
+                store
+                    .write_volume_needle(VolumeId(3), &mut needle)
+                    .map(|_| ())
+            };
+            tx.send(result).unwrap();
+        });
+
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("writer blocked while RDMA handle was open")
+            .unwrap();
+    }
+
+    #[test]
+    fn read_at_resolves_length_zero_after_same_cookie_rewrite() {
+        let (_tmp, store, fid) = make_store_with_needle(b"short", 0x89b26a98);
+        let store = Arc::new(RwLock::new(store));
+        let source = StoreNeedleSource::from_store_for_tests(store.clone());
+        let mut handle = source.open(&fid).unwrap();
+
+        {
+            let mut store = store.write().unwrap();
+            let mut needle = Needle {
+                id: NeedleId(1),
+                cookie: Cookie(0x89b26a98),
+                data: b"longer payload".to_vec(),
+                data_size: 14,
+                ..Needle::default()
+            };
+            store.write_volume_needle(VolumeId(3), &mut needle).unwrap();
+        }
+
+        let payload = handle.read_at(0, 0, 1024).unwrap();
+
+        assert_eq!(payload, b"longer payload");
     }
 }

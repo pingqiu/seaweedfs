@@ -1397,6 +1397,18 @@ impl Volume {
         })
     }
 
+    /// Read needle streaming info while returning a read lease that stays
+    /// active for the caller's handle lifetime.
+    pub fn read_needle_stream_info_with_lease(
+        &self,
+        n: &mut Needle,
+        read_deleted: bool,
+    ) -> Result<(NeedleStreamInfo, DataFileReadLease), VolumeError> {
+        let lease = self.data_file_access_control.read_lock();
+        let info = self.read_needle_stream_info(n, read_deleted)?;
+        Ok((info, lease))
+    }
+
     /// Re-lookup a needle's data-file offset after compaction may have moved it.
     ///
     /// Returns `(new_data_file_offset, current_compaction_revision)` or an error

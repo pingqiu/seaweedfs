@@ -1,19 +1,18 @@
-use std::fs::File;
-use std::path::Path;
 use std::sync::Arc;
 
-use bytes::BytesMut;
-use seaweed_rdma::{NeedleSource, RdmaReadRequest, RdmaReadResponse};
+use seaweed_rdma::{
+    RdmaOpenError, RdmaReadError, RdmaReadHandle, RdmaReadRequest, RdmaReadResponse,
+    RdmaReadableSource,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 use crate::rdma::parse_fid::parse_fid;
-use crate::storage::types::{DATA_SIZE_SIZE, NEEDLE_HEADER_SIZE};
 
 const REQUEST_WIRE_SIZE: usize = 64;
-const MAX_PREAD_BYTES: usize = 64 * 1024 * 1024;
+const MAX_READ_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ListenerConfig {
@@ -30,13 +29,13 @@ impl Default for ListenerConfig {
     }
 }
 
-pub struct Listener<S: NeedleSource + Send + Sync + 'static> {
+pub struct Listener<S: RdmaReadableSource + Send + Sync + 'static> {
     source: Arc<S>,
     config: ListenerConfig,
     inflight: Arc<Semaphore>,
 }
 
-impl<S: NeedleSource + Send + Sync + 'static> Listener<S> {
+impl<S: RdmaReadableSource + Send + Sync + 'static> Listener<S> {
     pub fn new(source: Arc<S>, config: ListenerConfig) -> Self {
         let inflight = Arc::new(Semaphore::new(config.max_inflight));
         Self {
@@ -59,14 +58,14 @@ impl<S: NeedleSource + Send + Sync + 'static> Listener<S> {
     }
 }
 
-pub struct BoundListener<S: NeedleSource + Send + Sync + 'static> {
+pub struct BoundListener<S: RdmaReadableSource + Send + Sync + 'static> {
     tcp: TcpListener,
     source: Arc<S>,
     inflight: Arc<Semaphore>,
     pub bound: std::net::SocketAddr,
 }
 
-impl<S: NeedleSource + Send + Sync + 'static> BoundListener<S> {
+impl<S: RdmaReadableSource + Send + Sync + 'static> BoundListener<S> {
     pub async fn serve(self) {
         loop {
             match self.tcp.accept().await {
@@ -88,7 +87,7 @@ impl<S: NeedleSource + Send + Sync + 'static> BoundListener<S> {
     }
 }
 
-async fn handle_connection<S: NeedleSource + Send + Sync + 'static>(
+async fn handle_connection<S: RdmaReadableSource + Send + Sync + 'static>(
     mut stream: TcpStream,
     source: Arc<S>,
     inflight: Arc<Semaphore>,
@@ -115,226 +114,118 @@ async fn handle_connection<S: NeedleSource + Send + Sync + 'static>(
             }
         };
 
-        let fid = req.fid_str();
-        match source.locate(fid) {
-            Some(loc) => {
-                let dat_path = match loc.dat_path.as_deref() {
-                    Some(dat_path) => dat_path.to_string(),
-                    None => {
-                        let resp = RdmaReadResponse::error(request_id);
-                        stream.write_all(resp.as_bytes()).await?;
-                        drop(permit);
-                        continue;
-                    }
-                };
-                let data_offset = loc.offset;
-                let data_size = loc.length;
-                let chunk_offset = req.offset;
-                let want_length = req.length;
-                let expected = match parse_fid(fid).ok() {
-                    Some((_, needle_id, cookie)) => (needle_id, cookie),
-                    None => {
-                        let resp = RdmaReadResponse::not_found(request_id);
-                        stream.write_all(resp.as_bytes()).await?;
-                        drop(permit);
-                        continue;
-                    }
-                };
-                let read_result = tokio::task::spawn_blocking(move || {
-                    pread_data_with_cookie(
-                        &dat_path,
-                        data_offset,
-                        data_size,
-                        chunk_offset,
-                        want_length,
-                        expected.0,
-                        expected.1,
-                    )
-                })
-                .await
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-
-                match read_result {
-                    Ok(PreadOutcome { data }) => {
-                        stream.write_all(&data).await?;
-                        let resp = RdmaReadResponse::ok(request_id, data.len() as u32);
-                        stream.write_all(resp.as_bytes()).await?;
-                        debug!(request_id, bytes = data.len(), "served RDMA TCP read");
-                    }
-                    Err(PreadError::CookieMismatch { expected, actual }) => {
-                        warn!(
-                            request_id,
-                            expected = format_args!("{:08x}", expected),
-                            actual = format_args!("{:08x}", actual),
-                            "RDMA read cookie mismatch"
-                        );
-                        let resp = RdmaReadResponse::cookie_mismatch(request_id);
-                        stream.write_all(resp.as_bytes()).await?;
-                    }
-                    Err(PreadError::RangeInvalid {
-                        data_size,
-                        requested_offset,
-                        requested_length,
-                    }) => {
-                        warn!(
-                            request_id,
-                            data_size,
-                            requested_offset,
-                            requested_length,
-                            "RDMA read range is outside needle payload"
-                        );
-                        let resp = RdmaReadResponse::range_invalid(request_id);
-                        stream.write_all(resp.as_bytes()).await?;
-                    }
-                    Err(PreadError::Io(e)) => {
-                        warn!(request_id, error = %e, "pread failed");
-                        let resp = RdmaReadResponse::error(request_id);
-                        stream.write_all(resp.as_bytes()).await?;
-                    }
-                }
-            }
-            None => {
-                let resp = RdmaReadResponse::not_found(request_id);
-                stream.write_all(resp.as_bytes()).await?;
-            }
-        }
+        let result = process_request(source.clone(), req).await;
+        write_request_result(&mut stream, request_id, result).await?;
         drop(permit);
     }
 }
 
-struct PreadOutcome {
-    data: Vec<u8>,
+async fn process_request<S: RdmaReadableSource + Send + Sync + 'static>(
+    source: Arc<S>,
+    req: RdmaReadRequest,
+) -> Result<Vec<u8>, ReadFailure> {
+    let fid = req.fid_str();
+    let (_vid, _needle_id, expected_cookie) = parse_fid(fid).map_err(|_| ReadFailure::NotFound)?;
+    let handle = source.open(fid).map_err(ReadFailure::Open)?;
+
+    if handle.cookie() != expected_cookie {
+        return Err(ReadFailure::CookieMismatch {
+            expected: expected_cookie,
+            actual: handle.cookie(),
+        });
+    }
+
+    tokio::task::spawn_blocking(move || read_payload(handle, req.offset, req.length))
+        .await
+        .map_err(|e| ReadFailure::Error(e.to_string()))?
+}
+
+fn read_payload(
+    mut handle: Box<dyn RdmaReadHandle>,
+    offset: u64,
+    length: u64,
+) -> Result<Vec<u8>, ReadFailure> {
+    handle
+        .read_at(offset, length, MAX_READ_BYTES)
+        .map_err(ReadFailure::Read)
+}
+
+async fn write_request_result(
+    stream: &mut TcpStream,
+    request_id: u64,
+    result: Result<Vec<u8>, ReadFailure>,
+) -> std::io::Result<()> {
+    match result {
+        Ok(data) => {
+            stream.write_all(&data).await?;
+            let resp = RdmaReadResponse::ok(request_id, data.len() as u32);
+            stream.write_all(resp.as_bytes()).await?;
+            debug!(request_id, bytes = data.len(), "served RDMA TCP read");
+        }
+        Err(ReadFailure::NotFound) | Err(ReadFailure::Open(RdmaOpenError::NotFound)) => {
+            let resp = RdmaReadResponse::not_found(request_id);
+            stream.write_all(resp.as_bytes()).await?;
+        }
+        Err(ReadFailure::CookieMismatch { expected, actual })
+        | Err(ReadFailure::Read(RdmaReadError::CookieMismatch { expected, actual })) => {
+            warn!(
+                request_id,
+                expected = format_args!("{:08x}", expected),
+                actual = format_args!("{:08x}", actual),
+                "RDMA read cookie mismatch"
+            );
+            let resp = RdmaReadResponse::cookie_mismatch(request_id);
+            stream.write_all(resp.as_bytes()).await?;
+        }
+        Err(ReadFailure::Read(RdmaReadError::RangeInvalid {
+            len,
+            offset,
+            requested,
+        })) => {
+            warn!(
+                request_id,
+                len, offset, requested, "RDMA read range is outside needle payload"
+            );
+            let resp = RdmaReadResponse::range_invalid(request_id);
+            stream.write_all(resp.as_bytes()).await?;
+        }
+        Err(ReadFailure::Read(RdmaReadError::NotFound)) => {
+            let resp = RdmaReadResponse::not_found(request_id);
+            stream.write_all(resp.as_bytes()).await?;
+        }
+        Err(err) => {
+            warn!(request_id, error = %err, "RDMA read failed");
+            let resp = RdmaReadResponse::error(request_id);
+            stream.write_all(resp.as_bytes()).await?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
-enum PreadError {
-    Io(std::io::Error),
-    CookieMismatch {
-        expected: u32,
-        actual: u32,
-    },
-    RangeInvalid {
-        data_size: u64,
-        requested_offset: u64,
-        requested_length: u64,
-    },
+enum ReadFailure {
+    NotFound,
+    Open(RdmaOpenError),
+    Read(RdmaReadError),
+    CookieMismatch { expected: u32, actual: u32 },
+    Error(String),
 }
 
-fn pread_data_with_cookie(
-    dat_path: &str,
-    data_offset: u64,
-    data_size: u64,
-    chunk_offset: u64,
-    want_length: u64,
-    expected_needle_id: u64,
-    expected_cookie: u32,
-) -> Result<PreadOutcome, PreadError> {
-    let file = File::open(Path::new(dat_path)).map_err(PreadError::Io)?;
-    let on_disk_cookie = read_cookie_for_payload(&file, data_offset, expected_needle_id)?;
-
-    if data_size == 0 {
-        return Err(PreadError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "needle has zero data_size",
-        )));
-    }
-    if on_disk_cookie != expected_cookie {
-        return Err(PreadError::CookieMismatch {
-            expected: expected_cookie,
-            actual: on_disk_cookie,
-        });
-    }
-
-    if want_length == 0 {
-        if chunk_offset >= data_size {
-            return Err(PreadError::RangeInvalid {
-                data_size,
-                requested_offset: chunk_offset,
-                requested_length: 0,
-            });
-        }
-    } else if chunk_offset
-        .checked_add(want_length)
-        .map(|end| end > data_size)
-        .unwrap_or(true)
-    {
-        return Err(PreadError::RangeInvalid {
-            data_size,
-            requested_offset: chunk_offset,
-            requested_length: want_length,
-        });
-    }
-
-    let available = data_size - chunk_offset;
-    let read_len_u64 = if want_length == 0 {
-        available
-    } else {
-        want_length
-    };
-    if read_len_u64 > MAX_PREAD_BYTES as u64 {
-        return Err(PreadError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "requested read exceeds MAX_PREAD_BYTES",
-        )));
-    }
-
-    let mut buf = BytesMut::zeroed(read_len_u64 as usize);
-    read_exact_at(&file, &mut buf, data_offset + chunk_offset).map_err(PreadError::Io)?;
-    Ok(PreadOutcome { data: buf.to_vec() })
-}
-
-fn read_cookie_for_payload(
-    file: &File,
-    data_offset: u64,
-    expected_needle_id: u64,
-) -> Result<u32, PreadError> {
-    let candidates = [
-        data_offset.checked_sub((NEEDLE_HEADER_SIZE + DATA_SIZE_SIZE) as u64),
-        data_offset.checked_sub(NEEDLE_HEADER_SIZE as u64),
-    ];
-    for candidate in candidates.into_iter().flatten() {
-        let mut header = [0u8; NEEDLE_HEADER_SIZE];
-        if read_exact_at(file, &mut header, candidate).is_err() {
-            continue;
-        }
-        let needle_id = u64::from_be_bytes([
-            header[4], header[5], header[6], header[7], header[8], header[9], header[10],
-            header[11],
-        ]);
-        if needle_id == expected_needle_id {
-            return Ok(u32::from_be_bytes([
-                header[0], header[1], header[2], header[3],
-            ]));
+impl std::fmt::Display for ReadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadFailure::NotFound => write!(f, "not found"),
+            ReadFailure::Open(e) => write!(f, "open failed: {e}"),
+            ReadFailure::Read(e) => write!(f, "read failed: {e}"),
+            ReadFailure::CookieMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "cookie mismatch expected={expected:#x} actual={actual:#x}"
+                )
+            }
+            ReadFailure::Error(msg) => write!(f, "{msg}"),
         }
     }
-    Err(PreadError::Io(std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        "could not find matching needle header before payload",
-    )))
-}
-
-#[cfg(unix)]
-fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
-    use std::os::unix::fs::FileExt;
-    file.read_exact_at(buf, offset)
-}
-
-#[cfg(windows)]
-fn read_exact_at(file: &File, buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
-    use std::os::windows::fs::FileExt;
-    let mut filled = 0;
-    while filled < buf.len() {
-        let n = file.seek_read(&mut buf[filled..], offset)?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "unexpected EOF in seek_read",
-            ));
-        }
-        filled += n;
-        offset += n as u64;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -344,9 +235,8 @@ mod tests {
     use std::time::Duration;
 
     use seaweed_rdma::{
-        NeedleLocation, NeedleSource, RdmaReadRequest, RdmaReadResponse,
-        RDMA_STATUS_COOKIE_MISMATCH, RDMA_STATUS_NOT_FOUND, RDMA_STATUS_OK,
-        RDMA_STATUS_RANGE_INVALID,
+        RdmaReadRequest, RdmaReadResponse, RDMA_STATUS_COOKIE_MISMATCH, RDMA_STATUS_ERROR,
+        RDMA_STATUS_NOT_FOUND, RDMA_STATUS_OK, RDMA_STATUS_RANGE_INVALID,
     };
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -354,22 +244,11 @@ mod tests {
 
     use super::{Listener, ListenerConfig};
     use crate::config::MinFreeSpace;
-    use crate::rdma::needle_source::locate_in_store;
+    use crate::rdma::needle_source::StoreNeedleSource;
     use crate::storage::needle::needle::Needle;
     use crate::storage::needle_map::NeedleMapKind;
     use crate::storage::store::Store;
     use crate::storage::types::{Cookie, DiskType, NeedleId, Version, VolumeId, VERSION_1};
-
-    struct StoreBackedSource {
-        store: Arc<RwLock<Store>>,
-    }
-
-    impl NeedleSource for StoreBackedSource {
-        fn locate(&self, id: &str) -> Option<NeedleLocation> {
-            let store = self.store.read().ok()?;
-            locate_in_store(&store, id)
-        }
-    }
 
     fn make_store_with_needle(data: &[u8], cookie: u32) -> (TempDir, Arc<RwLock<Store>>, String) {
         make_store_with_needle_version(data, cookie, Version::current())
@@ -411,7 +290,7 @@ mod tests {
     }
 
     async fn spawn_listener(store: Arc<RwLock<Store>>) -> SocketAddr {
-        let source = Arc::new(StoreBackedSource { store });
+        let source = Arc::new(StoreNeedleSource::from_store_for_tests(store));
         let listener = Listener::new(
             source,
             ListenerConfig {
@@ -553,7 +432,7 @@ mod tests {
 
         let resp = send_error_request(addr, RdmaReadRequest::new(15, &fid, 2, 3)).await;
 
-        assert_eq!(resp.status, RDMA_STATUS_NOT_FOUND);
+        assert_eq!(resp.status, RDMA_STATUS_ERROR);
         assert_eq!(resp.bytes_transferred, 0);
     }
 
