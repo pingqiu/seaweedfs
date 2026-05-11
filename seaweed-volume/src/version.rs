@@ -49,8 +49,8 @@ pub fn server_header() -> &'static str {
 
 fn parse_go_version_number() -> Option<String> {
     let src = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../weed/util/version/constants.go"
+        env!("SEAWEEDFS_WEED_DIR"),
+        "/util/version/constants.go"
     ));
     let mut major: Option<u32> = None;
     let mut minor: Option<u32> = None;
