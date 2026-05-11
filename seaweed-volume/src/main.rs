@@ -903,17 +903,31 @@ async fn run(
     let mut server_err: Option<String> = None;
     let mut http_handle = http_handle;
     let mut grpc_handle = grpc_handle;
-    let grpc_finished_first = tokio::select! {
-        _ = &mut http_handle => false,
-        _ = &mut grpc_handle => true,
+    enum ServerFirst {
+        Http(Result<(), tokio::task::JoinError>),
+        Grpc(Result<Result<(), tonic::transport::Error>, tokio::task::JoinError>),
+    }
+
+    let first_server = tokio::select! {
+        result = &mut http_handle => ServerFirst::Http(result),
+        result = &mut grpc_handle => ServerFirst::Grpc(result),
     };
-    // Inspect the gRPC result (already resolved if it finished first,
-    // otherwise await it now).
-    let grpc_result = if grpc_finished_first {
-        grpc_handle.await
-    } else {
-        // HTTP finished first; gRPC is still running. Await it.
-        grpc_handle.await
+
+    let grpc_result = match first_server {
+        ServerFirst::Grpc(result) => {
+            let _ = shutdown_tx.send(());
+            let _ = http_handle.await;
+            result
+        }
+        ServerFirst::Http(result) => {
+            if let Err(e) = result {
+                let msg = format!("HTTP task panicked: {}", e);
+                error!("{}", msg);
+                server_err = Some(msg);
+                let _ = shutdown_tx.send(());
+            }
+            grpc_handle.await
+        }
     };
     match grpc_result {
         Ok(Ok(())) => {}
@@ -930,8 +944,6 @@ async fn run(
             let _ = shutdown_tx.send(());
         }
     }
-    // Ensure the HTTP handle completes too.
-    let _ = http_handle.await;
     if let Some(h) = public_handle {
         let _ = h.await;
     }
