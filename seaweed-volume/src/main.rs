@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 use tracing::{error, info, warn};
 
 #[cfg(feature = "rdma")]
-use seaweed_rdma::{RcReadListener, RcReadListenerConfig, RcServeError};
+use seaweed_rdma::{RcReadListener, RcReadListenerConfig};
 use seaweed_volume::config::{self, RdmaTransport, VolumeServerConfig};
 use seaweed_volume::metrics;
 use seaweed_volume::pb::volume_server_pb::volume_server_server::VolumeServerServer;
@@ -582,24 +582,37 @@ async fn run(
                 #[cfg(feature = "rdma")]
                 let rdma_state = state.clone();
                 #[cfg(feature = "rdma")]
-                Some(tokio::task::spawn_blocking(move || loop {
-                    let mut should_stop = || {
+                Some(tokio::task::spawn_blocking(move || {
+                    let mut shutdown_seen = false;
+                    let result = listener.serve_until(|| {
                         if *rdma_state.is_stopping.read().unwrap() {
+                            shutdown_seen = true;
                             return true;
                         }
                         match rdma_shutdown.try_recv() {
-                            Ok(_) => true,
-                            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => true,
-                            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => true,
+                            Ok(_) => {
+                                shutdown_seen = true;
+                                true
+                            }
+                            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                                shutdown_seen = true;
+                                true
+                            }
+                            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                                shutdown_seen = true;
+                                true
+                            }
                             Err(tokio::sync::broadcast::error::TryRecvError::Empty) => false,
                         }
-                    };
-                    if should_stop() {
-                        return None;
-                    }
-                    match listener.serve_one_connection_until(&mut should_stop) {
-                        Ok(()) | Err(RcServeError::NoConnection) => {
-                            std::thread::sleep(std::time::Duration::from_millis(50));
+                    });
+                    let is_stopping = shutdown_seen || *rdma_state.is_stopping.read().unwrap();
+                    match result {
+                        Ok(()) if is_stopping => return None,
+                        Ok(()) => {
+                            let msg = "RDMA RC listener exited unexpectedly".to_string();
+                            error!("{}", msg);
+                            let _ = rdma_shutdown_tx.send(());
+                            return Some(msg);
                         }
                         Err(e) => {
                             let msg = format!("RDMA RC listener failed: {}", e);
