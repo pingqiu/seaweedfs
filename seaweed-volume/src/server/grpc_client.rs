@@ -110,7 +110,7 @@ pub fn build_grpc_endpoint(
 #[cfg(test)]
 mod tests {
     use super::{build_grpc_endpoint, grpc_endpoint_uri, load_outgoing_grpc_tls};
-    use crate::config::{NeedleMapKind, ReadMode, VolumeServerConfig};
+    use crate::config::{NeedleMapKind, RdmaTransport, ReadMode, VolumeServerConfig};
     use crate::security::tls::TlsPolicy;
 
     fn sample_config() -> VolumeServerConfig {
@@ -177,6 +177,7 @@ mod tests {
             security_file: String::new(),
             rdma_listen: String::new(),
             rdma_max_inflight: 256,
+            rdma_transport: RdmaTransport::Tcp,
         }
     }
 

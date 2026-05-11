@@ -2,7 +2,9 @@ use std::sync::{Arc, RwLock};
 
 use tracing::{error, info, warn};
 
-use seaweed_volume::config::{self, VolumeServerConfig};
+#[cfg(feature = "rdma")]
+use seaweed_rdma::{RcReadListener, RcReadListenerConfig, RcServeError};
+use seaweed_volume::config::{self, RdmaTransport, VolumeServerConfig};
 use seaweed_volume::metrics;
 use seaweed_volume::pb::volume_server_pb::volume_server_server::VolumeServerServer;
 use seaweed_volume::rdma::listener::{
@@ -485,52 +487,130 @@ async fn run(
     let rdma_monitor_handle = if config.rdma_listen.is_empty() {
         None
     } else {
-        let source = Arc::new(StoreNeedleSource::new(state.clone()));
-        let listener = RdmaListener::new(
-            source,
-            RdmaListenerConfig {
-                addr: config.rdma_listen.clone(),
-                max_inflight: config.rdma_max_inflight,
-            },
-        )
-        .bind()
-        .await
-        .map_err(|e| {
-            format!(
-                "Failed to bind RDMA listener to {}: {}",
-                config.rdma_listen, e
-            )
-        })?;
-        let bound = listener.bound;
-        info!(
-            "RDMA read listener serving on {} (max_inflight={})",
-            bound, config.rdma_max_inflight
-        );
-        let rdma_shutdown = shutdown_tx.subscribe();
-        let rdma_shutdown_tx = shutdown_tx.clone();
-        let rdma_state = state.clone();
-        let serve_handle = tokio::spawn(async move {
-            listener.serve_until(rdma_shutdown).await;
-        });
-        Some(tokio::spawn(async move {
-            let result = serve_handle.await;
-            let is_stopping = *rdma_state.is_stopping.read().unwrap();
-            match result {
-                Ok(()) if is_stopping => None,
-                Ok(()) => {
-                    let msg = "RDMA listener exited unexpectedly".to_string();
-                    error!("{}", msg);
-                    let _ = rdma_shutdown_tx.send(());
-                    Some(msg)
-                }
-                Err(e) => {
-                    let msg = format!("RDMA listener task failed: {}", e);
-                    error!("{}", msg);
-                    let _ = rdma_shutdown_tx.send(());
-                    Some(msg)
-                }
+        match config.rdma_transport {
+            RdmaTransport::Tcp => {
+                let source = Arc::new(StoreNeedleSource::new(state.clone()));
+                let listener = RdmaListener::new(
+                    source,
+                    RdmaListenerConfig {
+                        addr: config.rdma_listen.clone(),
+                        max_inflight: config.rdma_max_inflight,
+                    },
+                )
+                .bind()
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Failed to bind RDMA TCP listener to {}: {}",
+                        config.rdma_listen, e
+                    )
+                })?;
+                let bound = listener.bound;
+                info!(
+                    "RDMA TCP read listener serving on {} (max_inflight={})",
+                    bound, config.rdma_max_inflight
+                );
+                let rdma_shutdown = shutdown_tx.subscribe();
+                let rdma_shutdown_tx = shutdown_tx.clone();
+                let rdma_state = state.clone();
+                let serve_handle = tokio::spawn(async move {
+                    listener.serve_until(rdma_shutdown).await;
+                });
+                Some(tokio::spawn(async move {
+                    let result = serve_handle.await;
+                    let is_stopping = *rdma_state.is_stopping.read().unwrap();
+                    match result {
+                        Ok(()) if is_stopping => None,
+                        Ok(()) => {
+                            let msg = "RDMA TCP listener exited unexpectedly".to_string();
+                            error!("{}", msg);
+                            let _ = rdma_shutdown_tx.send(());
+                            Some(msg)
+                        }
+                        Err(e) => {
+                            let msg = format!("RDMA TCP listener task failed: {}", e);
+                            error!("{}", msg);
+                            let _ = rdma_shutdown_tx.send(());
+                            Some(msg)
+                        }
+                    }
+                }))
             }
-        }))
+            RdmaTransport::Rc => {
+                #[cfg(not(feature = "rdma"))]
+                {
+                    return Err(std::io::Error::other(
+                        "--rdma-transport rc requires building weed-volume with --features rdma",
+                    )
+                    .into());
+                }
+
+                #[cfg(feature = "rdma")]
+                let source = Arc::new(StoreNeedleSource::new(state.clone()));
+                #[cfg(feature = "rdma")]
+                let listen_addr = config.rdma_listen.parse().map_err(|e| {
+                    format!(
+                        "Invalid RDMA RC listen address {}: {}",
+                        config.rdma_listen, e
+                    )
+                })?;
+                #[cfg(feature = "rdma")]
+                let listener = RcReadListener::bind(
+                    source,
+                    RcReadListenerConfig {
+                        listen_addr,
+                        ..RcReadListenerConfig::default()
+                    },
+                )
+                .map_err(|e| {
+                    format!(
+                        "Failed to bind RDMA RC listener to {}: {}",
+                        config.rdma_listen, e
+                    )
+                })?;
+                #[cfg(feature = "rdma")]
+                let bound = listener
+                    .local_addr()
+                    .map_err(|e| format!("Failed to read RDMA RC listener address: {}", e))?;
+                #[cfg(feature = "rdma")]
+                info!("RDMA RC read listener serving on {}", bound);
+
+                #[cfg(feature = "rdma")]
+                let mut rdma_shutdown = shutdown_tx.subscribe();
+                #[cfg(feature = "rdma")]
+                let rdma_shutdown_tx = shutdown_tx.clone();
+                #[cfg(feature = "rdma")]
+                let rdma_state = state.clone();
+                #[cfg(feature = "rdma")]
+                Some(tokio::task::spawn_blocking(move || loop {
+                    let mut should_stop = || {
+                        if *rdma_state.is_stopping.read().unwrap() {
+                            return true;
+                        }
+                        match rdma_shutdown.try_recv() {
+                            Ok(_) => true,
+                            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => true,
+                            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => true,
+                            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => false,
+                        }
+                    };
+                    if should_stop() {
+                        return None;
+                    }
+                    match listener.serve_one_connection_until(&mut should_stop) {
+                        Ok(()) | Err(RcServeError::NoConnection) => {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                        Err(e) => {
+                            let msg = format!("RDMA RC listener failed: {}", e);
+                            error!("{}", msg);
+                            let _ = rdma_shutdown_tx.send(());
+                            return Some(msg);
+                        }
+                    }
+                }))
+            }
+        }
     };
 
     let state_shutdown = state.clone();
@@ -693,8 +773,7 @@ async fn run(
                     })
                     .await
             } else {
-                let incoming =
-                    tokio_stream::wrappers::TcpListenerStream::new(grpc_listener);
+                let incoming = tokio_stream::wrappers::TcpListenerStream::new(grpc_listener);
                 info!("gRPC server listening on {}", grpc_local_addr);
                 build_grpc_server_builder()
                     .layer(GrpcRequestIdLayer)

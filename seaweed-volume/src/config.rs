@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 
@@ -199,6 +199,17 @@ pub struct Cli {
     /// Maximum concurrent RDMA read requests.
     #[arg(long = "rdma-max-inflight", default_value = "256")]
     pub rdma_max_inflight: std::num::NonZeroUsize,
+
+    /// RDMA listener transport. `tcp` is the debug wire-compatible path;
+    /// `rc` uses real RDMA WRITE through seaweed-rdma.
+    #[arg(long = "rdma-transport", value_enum, default_value_t = RdmaTransport::Tcp)]
+    pub rdma_transport: RdmaTransport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RdmaTransport {
+    Tcp,
+    Rc,
 }
 
 /// Resolved configuration after applying defaults and validation.
@@ -270,6 +281,8 @@ pub struct VolumeServerConfig {
     pub rdma_listen: String,
     /// Maximum concurrent RDMA read requests.
     pub rdma_max_inflight: usize,
+    /// RDMA listener transport.
+    pub rdma_transport: RdmaTransport,
 }
 
 pub use crate::storage::needle_map::NeedleMapKind;
@@ -818,6 +831,7 @@ fn resolve_config(cli: Cli) -> VolumeServerConfig {
         security_file: cli.security_file,
         rdma_listen: cli.rdma_listen,
         rdma_max_inflight: cli.rdma_max_inflight.get(),
+        rdma_transport: cli.rdma_transport,
     }
 }
 
@@ -981,7 +995,9 @@ pub fn parse_security_config(path: &str) -> SecurityConfig {
                 },
                 Section::JwtSigning => match key {
                     "key" => cfg.jwt_signing_key = value.as_bytes().to_vec(),
-                    "expires_after_seconds" => cfg.jwt_signing_expires = value.parse().unwrap_or(10),
+                    "expires_after_seconds" => {
+                        cfg.jwt_signing_expires = value.parse().unwrap_or(10)
+                    }
                     _ => {}
                 },
                 Section::HttpsClient => match key {
@@ -1420,6 +1436,19 @@ mod tests {
         ]));
         assert_eq!(cfg.rdma_listen, "127.0.0.1:18515");
         assert_eq!(cfg.rdma_max_inflight, 32);
+        assert_eq!(cfg.rdma_transport, RdmaTransport::Tcp);
+    }
+
+    #[test]
+    fn test_resolve_config_parses_rdma_transport_rc() {
+        let cfg = resolve_config(Cli::parse_from([
+            "bin",
+            "--rdma-listen",
+            "127.0.0.1:18515",
+            "--rdma-transport",
+            "rc",
+        ]));
+        assert_eq!(cfg.rdma_transport, RdmaTransport::Rc);
     }
 
     #[test]
@@ -1434,6 +1463,7 @@ mod tests {
             "-rdma-listen".into(),
             "127.0.0.1:18515".into(),
             "-rdma-max-inflight=8".into(),
+            "-rdma-transport=rc".into(),
         ];
         let norm = normalize_args_vec(args);
         assert_eq!(
@@ -1443,6 +1473,7 @@ mod tests {
                 "--rdma-listen",
                 "127.0.0.1:18515",
                 "--rdma-max-inflight=8",
+                "--rdma-transport=rc",
             ]
         );
     }
@@ -1452,7 +1483,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
             tmp.path(),
-            "rdma-listen=127.0.0.1:18515\nrdma-max-inflight=64\n",
+            "rdma-listen=127.0.0.1:18515\nrdma-max-inflight=64\nrdma-transport=rc\n",
         )
         .unwrap();
         let args = normalize_args_vec(vec![
@@ -1465,6 +1496,7 @@ mod tests {
         let cfg = resolve_config(Cli::parse_from(merge_options_file(args)));
         assert_eq!(cfg.rdma_listen, "127.0.0.1:18515");
         assert_eq!(cfg.rdma_max_inflight, 8);
+        assert_eq!(cfg.rdma_transport, RdmaTransport::Rc);
     }
 
     #[test]
