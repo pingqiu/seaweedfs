@@ -1329,16 +1329,22 @@ impl Volume {
         #[cfg_attr(feature = "5bytes", allow(unused_mut))]
         let mut offset = nv.offset.to_actual_offset();
         let version = self.version();
-        let actual_size = get_actual_size(read_size, version);
 
-        // Read the full needle bytes (including data) for metadata parsing.
-        // We use read_bytes_meta_only which skips copying the data payload.
+        // V2+ reads only the header and metadata tail. The payload itself is
+        // streamed later from `NeedleStreamSource`, so reading it here would
+        // double the disk traffic on the RDMA path. V1 keeps the legacy
+        // full-record parse because its stream body includes a length prefix.
         #[cfg_attr(feature = "5bytes", allow(unused_mut))]
         let mut read_and_parse = |off: i64| -> Result<(), VolumeError> {
-            let mut buf = vec![0u8; actual_size as usize];
-            self.read_exact_at_backend(&mut buf, off as u64)?;
-            n.read_bytes_meta_only(&mut buf, off, read_size, version)?;
-            Ok(())
+            if version == VERSION_1 {
+                let actual_size = get_actual_size(read_size, version);
+                let mut buf = vec![0u8; actual_size as usize];
+                self.read_exact_at_backend(&mut buf, off as u64)?;
+                n.read_bytes_meta_only(&mut buf, off, read_size, version)?;
+                Ok(())
+            } else {
+                self.read_needle_meta_blob_and_parse(n, off, read_size)
+            }
         };
 
         match read_and_parse(offset) {
@@ -3414,6 +3420,10 @@ mod tests {
     }
 
     fn make_test_volume(dir: &str) -> Volume {
+        make_test_volume_with_version(dir, Version::current())
+    }
+
+    fn make_test_volume_with_version(dir: &str, version: Version) -> Volume {
         Volume::new(
             dir,
             dir,
@@ -3423,7 +3433,7 @@ mod tests {
             None,
             None,
             0,
-            Version::current(),
+            version,
         )
         .unwrap()
     }
@@ -4066,6 +4076,36 @@ mod tests {
         assert_eq!(info.compaction_revision, v.super_block.compaction_revision);
         assert_eq!(info.data_size, data.len() as u32);
         assert!(info.data_file_offset > 0);
+    }
+
+    #[test]
+    fn test_stream_info_v1_preserves_legacy_body_offset_and_size() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let mut v = make_test_volume_with_version(dir, VERSION_1);
+        let data = b"v1-stream-payload".to_vec();
+        let mut n = Needle {
+            id: NeedleId(7),
+            cookie: Cookie(0x01020304),
+            data: data.clone(),
+            data_size: data.len() as u32,
+            ..Needle::default()
+        };
+        v.write_needle(&mut n, true).unwrap();
+
+        let mut read_n = Needle {
+            id: NeedleId(7),
+            cookie: Cookie(0x01020304),
+            ..Needle::default()
+        };
+        let info = v.read_needle_stream_info(&mut read_n, false).unwrap();
+        let mut streamed = vec![0u8; info.data_size as usize];
+        info.source
+            .read_exact_at(&mut streamed, info.data_file_offset)
+            .unwrap();
+
+        assert_eq!(info.data_size, 22);
+        assert_eq!(&streamed[4..4 + data.len()], data.as_slice());
     }
 
     #[test]
