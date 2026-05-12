@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use seaweed_rdma::{
     NeedleLocation, NeedleSource, RdmaOpenError, RdmaReadError, RdmaReadHandle, RdmaReadableSource,
+    ReadSegment,
 };
 
 use crate::rdma::parse_fid::parse_fid;
@@ -240,6 +241,48 @@ impl RdmaReadHandle for RustVolumeReadHandle {
         self.cookie
     }
 
+    fn supports_direct_slot_reads(&self) -> bool {
+        true
+    }
+
+    fn validate_read_range(&mut self, offset: u64, length: u64) -> Result<(), RdmaReadError> {
+        let access = self.access.clone();
+        access.with_read(|store| {
+            // Refresh under the backend guard before slot allocation so range
+            // and cookie failures keep their wire status precedence over BUSY.
+            let _lease = self.refresh_for_read(store, self.cookie)?;
+            validate_range(self.data_size, offset, length)
+        })
+    }
+
+    fn read_exact_at_segments(
+        &mut self,
+        offset: u64,
+        segments: &mut [ReadSegment],
+    ) -> Result<(), RdmaReadError> {
+        let requested = segments.iter().try_fold(0u64, |acc, segment| {
+            acc.checked_add(segment.length as u64)
+                .ok_or_else(|| RdmaReadError::Other("segment length overflow".to_string()))
+        })?;
+        let access = self.access.clone();
+        access.with_read(|store| {
+            // Hold one store read guard and one data-file read lease across the
+            // entire logical request so multi-slot RDMA reads cannot mix
+            // snapshots across compaction or same-cookie rewrites.
+            let _lease = self.refresh_for_read(store, self.cookie)?;
+            validate_range(self.data_size, offset, requested)?;
+            for segment in segments {
+                let segment_offset = offset
+                    .checked_add(segment.request_offset)
+                    .ok_or_else(|| RdmaReadError::Other("segment offset overflow".to_string()))?;
+                let buf =
+                    unsafe { std::slice::from_raw_parts_mut(segment.slot.ptr, segment.length) };
+                self.read_with_current_source(segment_offset, buf)?;
+            }
+            Ok(())
+        })
+    }
+
     fn read_exact_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), RdmaReadError> {
         let requested = buf.len() as u64;
         let access = self.access.clone();
@@ -368,7 +411,7 @@ mod tests {
     use crate::storage::store::Store;
     use crate::storage::types::{Cookie, DiskType, NeedleId, Version, VolumeId};
     use seaweed_rdma::buffer_pool::{BufferPool, BufferPoolConfig};
-    use seaweed_rdma::{RdmaReadError, RdmaReadableSource, SlotReader};
+    use seaweed_rdma::{RdmaReadError, RdmaReadableSource, SlotReadError, SlotReader};
     use std::fs::File;
     use std::sync::{Arc, RwLock};
     use tempfile::TempDir;
@@ -496,6 +539,16 @@ mod tests {
     }
 
     #[test]
+    fn store_read_handle_advertises_direct_slot_reads() {
+        let (_tmp, store, fid) = make_store_with_needle(b"hello rdma", 0x89b26a98);
+        let source = StoreNeedleSource::from_store_for_tests(Arc::new(RwLock::new(store)));
+
+        let handle = source.open(&fid).unwrap();
+
+        assert!(handle.supports_direct_slot_reads());
+    }
+
+    #[test]
     fn store_read_handle_fills_rdma_buffer_slots() {
         let (_tmp, store, fid) = make_store_with_needle(b"abcdefghijklmnopqrstuvwxyz", 0x89b26a98);
         let source = StoreNeedleSource::from_store_for_tests(Arc::new(RwLock::new(store)));
@@ -531,6 +584,117 @@ mod tests {
         assert_eq!(payload, b"fghijklmnopqrstuv");
 
         assert_eq!(batch.deallocate(), 3);
+        assert_eq!(pool.stats().allocated_slots, 0);
+    }
+
+    #[test]
+    fn direct_slot_read_revalidates_shorter_same_cookie_rewrite() {
+        let (_tmp, store, fid) = make_store_with_needle(b"abcdefgh", 0x89b26a98);
+        let store = Arc::new(RwLock::new(store));
+        let source = StoreNeedleSource::from_store_for_tests(store.clone());
+        let mut handle = source.open(&fid).unwrap();
+        let pool = Arc::new(BufferPool::new(BufferPoolConfig {
+            size_bytes: 16,
+            slot_size: 8,
+            aligned: false,
+            prefer_hugepage: false,
+        }));
+        let reader = SlotReader::new(pool.clone());
+
+        {
+            let mut store = store.write().unwrap();
+            let mut needle = Needle {
+                id: NeedleId(1),
+                cookie: Cookie(0x89b26a98),
+                data: b"abcd".to_vec(),
+                data_size: 4,
+                ..Needle::default()
+            };
+            store.write_volume_needle(VolumeId(3), &mut needle).unwrap();
+        }
+
+        let err = reader
+            .read_handle_to_slots(9, handle.as_mut(), 0, 8)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            SlotReadError::Read(RdmaReadError::RangeInvalid {
+                len: 4,
+                offset: 0,
+                requested: 8
+            })
+        ));
+        assert_eq!(pool.stats().allocated_slots, 0);
+    }
+
+    #[test]
+    fn direct_slot_range_invalid_precedes_buffer_exhaustion() {
+        let (_tmp, store, fid) = make_store_with_needle(b"abcd", 0x89b26a98);
+        let source = StoreNeedleSource::from_store_for_tests(Arc::new(RwLock::new(store)));
+        let mut handle = source.open(&fid).unwrap();
+        let pool = Arc::new(BufferPool::new(BufferPoolConfig {
+            size_bytes: 4,
+            slot_size: 4,
+            aligned: false,
+            prefer_hugepage: false,
+        }));
+        let reader = SlotReader::new(pool.clone());
+
+        let err = reader
+            .read_handle_to_slots(11, handle.as_mut(), 0, 8)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            SlotReadError::Read(RdmaReadError::RangeInvalid {
+                len: 4,
+                offset: 0,
+                requested: 8
+            })
+        ));
+        assert_eq!(pool.stats().allocated_slots, 0);
+    }
+
+    #[test]
+    fn direct_slot_read_accepts_longer_same_cookie_rewrite() {
+        let (_tmp, store, fid) = make_store_with_needle(b"abcd", 0x89b26a98);
+        let store = Arc::new(RwLock::new(store));
+        let source = StoreNeedleSource::from_store_for_tests(store.clone());
+        let mut handle = source.open(&fid).unwrap();
+        let pool = Arc::new(BufferPool::new(BufferPoolConfig {
+            size_bytes: 16,
+            slot_size: 4,
+            aligned: false,
+            prefer_hugepage: false,
+        }));
+        let reader = SlotReader::new(pool.clone());
+
+        {
+            let mut store = store.write().unwrap();
+            let mut needle = Needle {
+                id: NeedleId(1),
+                cookie: Cookie(0x89b26a98),
+                data: b"abcdefgh".to_vec(),
+                data_size: 8,
+                ..Needle::default()
+            };
+            store.write_volume_needle(VolumeId(3), &mut needle).unwrap();
+        }
+
+        let batch = reader
+            .read_handle_to_slots(10, handle.as_mut(), 0, 8)
+            .unwrap();
+
+        let mut payload = Vec::new();
+        for segment in batch.segments() {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(segment.slot.ptr as *const u8, segment.length)
+            };
+            payload.extend_from_slice(bytes);
+        }
+        assert_eq!(payload, b"abcdefgh");
+        assert_eq!(batch.deallocate(), 2);
         assert_eq!(pool.stats().allocated_slots, 0);
     }
 
