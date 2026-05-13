@@ -2994,6 +2994,10 @@ pub async fn healthz_handler(State(state): State<Arc<VolumeServerState>>) -> Res
     StatusCode::OK.into_response()
 }
 
+pub async fn sra_version_handler() -> Response {
+    axum::Json(crate::version::sra_version_json()).into_response()
+}
+
 // ============================================================================
 // Metrics Handler
 // ============================================================================
