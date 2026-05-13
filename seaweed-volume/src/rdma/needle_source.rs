@@ -356,7 +356,10 @@ mod tests {
     use crate::storage::store::Store;
     use crate::storage::types::{Cookie, DiskType, NeedleId, Version, VolumeId};
     use seaweed_rdma::buffer_pool::{BufferPool, BufferPoolConfig};
-    use seaweed_rdma::{RdmaReadError, RdmaReadableSource, SlotReadError, SlotReader};
+    use seaweed_rdma::{
+        plan_windows, ChunkRef, RangeSpec, RdmaReadError, RdmaReadableSource, SlotReadError,
+        SlotReader, WindowPolicy,
+    };
     use std::fs::File;
     use std::sync::{Arc, RwLock};
     use tempfile::TempDir;
@@ -754,5 +757,133 @@ mod tests {
         let payload = handle.read_at(0, 0, 1024).unwrap();
 
         assert_eq!(payload, b"longer payload");
+    }
+
+    #[test]
+    fn rust_volume_metadata_plans_large_read_as_bounded_windows() {
+        let (_tmp, store, fid) =
+            make_store_with_needle(b"abcdefghijklmnopqrstuvwxyz", 0x89b26a98);
+        let loc = locate_in_store(&store, &fid).unwrap();
+        let policy = WindowPolicy {
+            slot_size: 4,
+            max_window_bytes: 8,
+            max_request_slots: 2,
+            max_parallel_windows: 1,
+        };
+
+        let plan = plan_windows(
+            &[ChunkRef {
+                fid: fid.clone(),
+                object_offset: 0,
+                chunk_size: loc.length,
+            }],
+            RangeSpec {
+                start: 0,
+                length: loc.length,
+            },
+            &policy,
+        )
+        .unwrap();
+
+        assert_eq!(plan.total_bytes, 26);
+        assert_eq!(plan.windows.len(), 4);
+        assert_eq!(
+            plan.windows
+                .iter()
+                .map(|window| window.length)
+                .collect::<Vec<_>>(),
+            vec![8, 8, 8, 2]
+        );
+        assert!(plan
+            .windows
+            .iter()
+            .all(|window| window.slots_needed <= policy.max_request_slots));
+        assert!(plan.windows.iter().all(|window| window.fid == fid));
+    }
+
+    #[test]
+    fn length_zero_remainder_is_resolved_before_window_planning() {
+        let (_tmp, store, fid) = make_store_with_needle(b"short", 0x89b26a98);
+        let store = Arc::new(RwLock::new(store));
+        let source = StoreNeedleSource::from_store_for_tests(store.clone());
+        let mut handle = source.open(&fid).unwrap();
+
+        {
+            let mut store = store.write().unwrap();
+            let mut needle = Needle {
+                id: NeedleId(1),
+                cookie: Cookie(0x89b26a98),
+                data: b"longer payload".to_vec(),
+                data_size: 14,
+                ..Needle::default()
+            };
+            store.write_volume_needle(VolumeId(3), &mut needle).unwrap();
+        }
+
+        let payload = handle.read_at(3, 0, 1024).unwrap();
+        assert_eq!(payload, b"ger payload");
+
+        let logical_len = handle.len();
+        let requested_offset = 3;
+        let requested_len = logical_len - requested_offset;
+        let policy = WindowPolicy {
+            slot_size: 4,
+            max_window_bytes: 8,
+            max_request_slots: 2,
+            max_parallel_windows: 1,
+        };
+        let plan = plan_windows(
+            &[ChunkRef {
+                fid: fid.clone(),
+                object_offset: 0,
+                chunk_size: logical_len,
+            }],
+            RangeSpec {
+                start: requested_offset,
+                length: requested_len,
+            },
+            &policy,
+        )
+        .unwrap();
+
+        assert_eq!(plan.total_bytes, 11);
+        assert_eq!(
+            plan.windows
+                .iter()
+                .map(|window| (window.chunk_offset, window.length))
+                .collect::<Vec<_>>(),
+            vec![(3, 8), (11, 3)]
+        );
+        assert!(plan
+            .windows
+            .iter()
+            .all(|window| window.slots_needed <= policy.max_request_slots));
+    }
+
+    #[test]
+    fn bypassing_window_planner_still_rejects_oversized_slot_read() {
+        let (_tmp, store, fid) = make_store_with_needle(b"abcdefghijkl", 0x89b26a98);
+        let source = StoreNeedleSource::from_store_for_tests(Arc::new(RwLock::new(store)));
+        let mut handle = source.open(&fid).unwrap();
+        let pool = Arc::new(BufferPool::new(BufferPoolConfig {
+            size_bytes: 16,
+            slot_size: 4,
+            aligned: false,
+            prefer_hugepage: false,
+        }));
+        let reader = SlotReader::new(pool.clone()).with_max_request_slots(2);
+
+        let err = reader
+            .read_handle_to_slots(16, handle.as_mut(), 0, 12)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            SlotReadError::TooLarge {
+                requested: 3,
+                max: 2
+            }
+        ));
+        assert_eq!(pool.stats().allocated_slots, 0);
     }
 }
