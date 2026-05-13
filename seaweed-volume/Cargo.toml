@@ -116,7 +116,7 @@ async-trait = "0.1"
 futures = "0.3"
 async-stream = "0.3"
 x509-parser = "0.16"
-seaweed-rdma = { path = "../../rdma/sra/seaweed-rdma" }
+seaweed-rdma = { path = "../../rdma/sra-next/seaweed-rdma" }
 
 # Disk space checking
 sysinfo = "0.31"
@@ -139,5 +139,5 @@ tempfile = "3"
 tonic-build = "0.12"
 
 [patch.crates-io]
-rdma-sys = { path = "../../rdma/sra/third_party/rdma-sys" }
+rdma-sys = { path = "../../rdma/sra-next/seaweed-rdma/third_party/rdma-sys" }
 reed-solomon-erasure = { path = "vendor/reed-solomon-erasure" }
