@@ -176,9 +176,49 @@ fn read_payload(
     offset: u64,
     length: u64,
 ) -> Result<Vec<u8>, ReadFailure> {
+    read_payload_windowed(handle.as_mut(), offset, length, MAX_READ_BYTES)
+}
+
+fn read_payload_windowed(
+    handle: &mut dyn RdmaReadHandle,
+    offset: u64,
+    length: u64,
+    max_window_bytes: usize,
+) -> Result<Vec<u8>, ReadFailure> {
     handle
-        .read_at(offset, length, MAX_READ_BYTES)
-        .map_err(ReadFailure::Read)
+        .validate_read_range(offset, length)
+        .map_err(ReadFailure::Read)?;
+    let total_len = if length == 0 {
+        handle
+            .len()
+            .checked_sub(offset)
+            .ok_or_else(|| {
+                ReadFailure::Read(RdmaReadError::RangeInvalid {
+                    len: handle.len(),
+                    offset,
+                    requested: 0,
+                })
+            })?
+    } else {
+        length
+    };
+
+    let mut payload = Vec::with_capacity(total_len.min(usize::MAX as u64) as usize);
+    let mut current_offset = offset;
+    let mut remaining = total_len;
+    while remaining > 0 {
+        let window_len = remaining.min(max_window_bytes as u64);
+        let mut window = handle
+            .read_at(current_offset, window_len, max_window_bytes)
+            .map_err(ReadFailure::Read)?;
+        payload.append(&mut window);
+        current_offset = current_offset.checked_add(window_len).ok_or_else(|| {
+            ReadFailure::Read(RdmaReadError::Other("window offset overflow".to_string()))
+        })?;
+        remaining -= window_len;
+    }
+
+    Ok(payload)
 }
 
 async fn write_request_result(
@@ -264,15 +304,15 @@ mod tests {
     use std::time::Duration;
 
     use seaweed_rdma::{
-        RdmaReadRequest, RdmaReadResponse, RDMA_STATUS_COOKIE_MISMATCH, RDMA_STATUS_ERROR,
-        RDMA_STATUS_NOT_FOUND, RDMA_STATUS_OK, RDMA_STATUS_RANGE_INVALID,
+        RdmaReadRequest, RdmaReadResponse, RdmaReadableSource, RDMA_STATUS_COOKIE_MISMATCH,
+        RDMA_STATUS_ERROR, RDMA_STATUS_NOT_FOUND, RDMA_STATUS_OK, RDMA_STATUS_RANGE_INVALID,
     };
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
     use tokio::sync::broadcast;
 
-    use super::{Listener, ListenerConfig};
+    use super::{read_payload_windowed, Listener, ListenerConfig};
     use crate::config::MinFreeSpace;
     use crate::rdma::needle_source::StoreNeedleSource;
     use crate::storage::needle::needle::Needle;
@@ -418,6 +458,30 @@ mod tests {
         assert_eq!(data, b"defg");
         assert_eq!(resp.status, RDMA_STATUS_OK);
         assert_eq!(resp.bytes_transferred, 4);
+    }
+
+    #[test]
+    fn read_payload_windowed_serves_valid_read_larger_than_one_window() {
+        let (_tmp, store, fid) =
+            make_store_with_needle(b"abcdefghijklmnopqrstuvwxyz", 0x89b26a98);
+        let source = StoreNeedleSource::from_store_for_tests(store);
+        let mut handle = source.open(&fid).unwrap();
+
+        let payload = read_payload_windowed(handle.as_mut(), 0, 26, 8).unwrap();
+
+        assert_eq!(payload, b"abcdefghijklmnopqrstuvwxyz");
+    }
+
+    #[test]
+    fn read_payload_windowed_resolves_length_zero_before_splitting() {
+        let (_tmp, store, fid) =
+            make_store_with_needle(b"abcdefghijklmnopqrstuvwxyz", 0x89b26a98);
+        let source = StoreNeedleSource::from_store_for_tests(store);
+        let mut handle = source.open(&fid).unwrap();
+
+        let payload = read_payload_windowed(handle.as_mut(), 20, 0, 3).unwrap();
+
+        assert_eq!(payload, b"uvwxyz");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
