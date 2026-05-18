@@ -49,8 +49,8 @@ pub fn favicon_asset() -> EmbeddedAsset {
     EmbeddedAsset {
         content_type: "image/x-icon",
         bytes: include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../weed/static/favicon.ico"
+            env!("SEAWEEDFS_WEED_DIR"),
+            "/static/favicon.ico"
         )),
     }
 }
@@ -61,64 +61,64 @@ pub fn lookup_static_asset(path: &str) -> Option<EmbeddedAsset> {
         "bootstrap/3.3.1/css/bootstrap.min.css" => EmbeddedAsset {
             content_type: "text/css; charset=utf-8",
             bytes: include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../weed/static/bootstrap/3.3.1/css/bootstrap.min.css"
+                env!("SEAWEEDFS_WEED_DIR"),
+                "/static/bootstrap/3.3.1/css/bootstrap.min.css"
             )),
         },
         "bootstrap/3.3.1/fonts/glyphicons-halflings-regular.eot" => EmbeddedAsset {
             content_type: "application/vnd.ms-fontobject",
             bytes: include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../weed/static/bootstrap/3.3.1/fonts/glyphicons-halflings-regular.eot"
+                env!("SEAWEEDFS_WEED_DIR"),
+                "/static/bootstrap/3.3.1/fonts/glyphicons-halflings-regular.eot"
             )),
         },
         "bootstrap/3.3.1/fonts/glyphicons-halflings-regular.svg" => EmbeddedAsset {
             content_type: "image/svg+xml",
             bytes: include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../weed/static/bootstrap/3.3.1/fonts/glyphicons-halflings-regular.svg"
+                env!("SEAWEEDFS_WEED_DIR"),
+                "/static/bootstrap/3.3.1/fonts/glyphicons-halflings-regular.svg"
             )),
         },
         "bootstrap/3.3.1/fonts/glyphicons-halflings-regular.ttf" => EmbeddedAsset {
             content_type: "font/ttf",
             bytes: include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../weed/static/bootstrap/3.3.1/fonts/glyphicons-halflings-regular.ttf"
+                env!("SEAWEEDFS_WEED_DIR"),
+                "/static/bootstrap/3.3.1/fonts/glyphicons-halflings-regular.ttf"
             )),
         },
         "bootstrap/3.3.1/fonts/glyphicons-halflings-regular.woff" => EmbeddedAsset {
             content_type: "font/woff",
             bytes: include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../weed/static/bootstrap/3.3.1/fonts/glyphicons-halflings-regular.woff"
+                env!("SEAWEEDFS_WEED_DIR"),
+                "/static/bootstrap/3.3.1/fonts/glyphicons-halflings-regular.woff"
             )),
         },
         "images/folder.gif" => EmbeddedAsset {
             content_type: "image/gif",
             bytes: include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../weed/static/images/folder.gif"
+                env!("SEAWEEDFS_WEED_DIR"),
+                "/static/images/folder.gif"
             )),
         },
         "javascript/jquery-3.6.0.min.js" => EmbeddedAsset {
             content_type: "application/javascript; charset=utf-8",
             bytes: include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../weed/static/javascript/jquery-3.6.0.min.js"
+                env!("SEAWEEDFS_WEED_DIR"),
+                "/static/javascript/jquery-3.6.0.min.js"
             )),
         },
         "javascript/jquery-sparklines/2.1.2/jquery.sparkline.min.js" => EmbeddedAsset {
             content_type: "application/javascript; charset=utf-8",
             bytes: include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../weed/static/javascript/jquery-sparklines/2.1.2/jquery.sparkline.min.js"
+                env!("SEAWEEDFS_WEED_DIR"),
+                "/static/javascript/jquery-sparklines/2.1.2/jquery.sparkline.min.js"
             )),
         },
         "seaweed50x50.png" => EmbeddedAsset {
             content_type: "image/png",
             bytes: include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../weed/static/seaweed50x50.png"
+                env!("SEAWEEDFS_WEED_DIR"),
+                "/static/seaweed50x50.png"
             )),
         },
         _ => return None,

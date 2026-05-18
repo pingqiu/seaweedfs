@@ -2,6 +2,8 @@
 
 use std::sync::OnceLock;
 
+static RUNTIME_RDMA_POLICY: OnceLock<(String, &'static str)> = OnceLock::new();
+
 #[cfg(feature = "5bytes")]
 const SIZE_LIMIT: &str = "8000GB"; // Matches Go production builds (5BytesOffset)
 #[cfg(not(feature = "5bytes"))]
@@ -47,10 +49,89 @@ pub fn server_header() -> &'static str {
         .as_str()
 }
 
+pub fn build_git_sha() -> &'static str {
+    let sha = option_env!("WEED_VOLUME_BUILD_GIT_SHA")
+        .or(option_env!("SEAWEEDFS_COMMIT"))
+        .or(option_env!("GIT_COMMIT"))
+        .or(option_env!("GIT_SHA"))
+        .unwrap_or("unknown");
+    if sha.is_empty() {
+        "unknown"
+    } else {
+        sha
+    }
+}
+
+pub fn build_git_dirty() -> bool {
+    matches!(option_env!("WEED_VOLUME_BUILD_GIT_DIRTY"), Some("true"))
+}
+
+pub fn build_unix_seconds() -> &'static str {
+    option_env!("WEED_VOLUME_BUILD_UNIX_SECONDS").unwrap_or("unknown")
+}
+
+pub fn enabled_features() -> Vec<&'static str> {
+    let mut features = Vec::new();
+    #[cfg(feature = "5bytes")]
+    features.push("5bytes");
+    #[cfg(feature = "rdma")]
+    features.push("rdma");
+    features
+}
+
+pub fn rdma_transports() -> Vec<&'static str> {
+    #[cfg(feature = "rdma")]
+    {
+        vec!["tcp", "rc"]
+    }
+    #[cfg(not(feature = "rdma"))]
+    {
+        vec!["tcp"]
+    }
+}
+
+pub fn default_rdma_policy_fingerprint() -> String {
+    seaweed_rdma::RdmaReadPolicy::for_pool_with_scheduler(
+        4 * 1024 * 1024,
+        64,
+        seaweed_rdma::SchedulerKind::SlidingWindowLane,
+    )
+    .fingerprint()
+}
+
+pub fn set_runtime_rdma_policy(policy: &seaweed_rdma::RdmaReadPolicy) {
+    let _ = RUNTIME_RDMA_POLICY.set((policy.fingerprint(), policy.scheduler.kind.as_str()));
+}
+
+fn runtime_rdma_policy() -> (String, &'static str) {
+    RUNTIME_RDMA_POLICY
+        .get()
+        .cloned()
+        .unwrap_or_else(|| (default_rdma_policy_fingerprint(), "sliding-lane"))
+}
+
+pub fn sra_version_json() -> serde_json::Value {
+    let (policy_fingerprint, rdma_scheduler) = runtime_rdma_policy();
+    serde_json::json!({
+        "service": "weed-volume",
+        "git_sha": build_git_sha(),
+        "git_dirty": build_git_dirty(),
+        "build_unix_seconds": build_unix_seconds(),
+        "build_profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+        "crate_version": env!("CARGO_PKG_VERSION"),
+        "seaweedfs_version": version_number(),
+        "features": enabled_features(),
+        "rdma_transports": rdma_transports(),
+        "wire_protocol_version": seaweed_rdma::sra_hello::PROTOCOL_VERSION,
+        "policy_fingerprint": policy_fingerprint,
+        "rdma_scheduler": rdma_scheduler,
+    })
+}
+
 fn parse_go_version_number() -> Option<String> {
     let src = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../weed/util/version/constants.go"
+        env!("SEAWEEDFS_WEED_DIR"),
+        "/util/version/constants.go"
     ));
     let mut major: Option<u32> = None;
     let mut minor: Option<u32> = None;
@@ -68,6 +149,29 @@ fn parse_go_version_number() -> Option<String> {
     match (major, minor) {
         (Some(maj), Some(min)) => Some(format!("{}.{}", maj, format!("{:02}", min))),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sra_version_json_contains_release_gate_fields() {
+        let value = sra_version_json();
+        assert_eq!(value["service"], "weed-volume");
+        assert!(value["git_sha"].as_str().is_some());
+        assert!(value["git_dirty"].as_bool().is_some());
+        assert!(value["build_profile"].as_str().is_some());
+        assert!(value["crate_version"].as_str().is_some());
+        assert!(value["features"].as_array().is_some());
+        assert!(value["rdma_transports"].as_array().is_some());
+        assert!(value["wire_protocol_version"].as_u64().unwrap() > 0);
+        assert!(value["policy_fingerprint"]
+            .as_str()
+            .unwrap()
+            .starts_with("fnv64:"));
+        assert_eq!(value["rdma_scheduler"], "sliding-lane");
     }
 }
 

@@ -2,6 +2,8 @@ pub mod config;
 pub mod images;
 pub mod metrics;
 pub mod remote_storage;
+pub mod rdma_stats;
+pub mod rdma;
 pub mod security;
 pub mod server;
 pub mod storage;

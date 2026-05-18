@@ -461,6 +461,24 @@ impl Store {
         vol.read_needle_stream_info(n, read_deleted)
     }
 
+    /// Read needle metadata and return streaming info plus a read lease
+    /// that the caller keeps alive while streaming.
+    pub fn read_volume_needle_stream_info_with_lease(
+        &self,
+        vid: VolumeId,
+        n: &mut Needle,
+        read_deleted: bool,
+    ) -> Result<
+        (
+            crate::storage::volume::NeedleStreamInfo,
+            crate::storage::volume::DataFileReadLease,
+        ),
+        VolumeError,
+    > {
+        let (_, vol) = self.find_volume(vid).ok_or(VolumeError::NotFound)?;
+        vol.read_needle_stream_info_with_lease(n, read_deleted)
+    }
+
     /// Re-lookup a needle's data-file offset after compaction may have moved it.
     /// Returns `(new_data_file_offset, current_compaction_revision)`.
     pub fn re_lookup_needle_data_offset(
