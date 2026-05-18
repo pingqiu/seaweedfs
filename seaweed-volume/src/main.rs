@@ -555,10 +555,19 @@ async fn run(
                     )
                 })?;
                 #[cfg(feature = "rdma")]
+                let read_policy = seaweed_rdma::RdmaReadPolicy::for_pool_with_scheduler(
+                    4 * 1024 * 1024,
+                    64,
+                    config.rdma_scheduler.to_scheduler_kind(),
+                );
+                #[cfg(feature = "rdma")]
+                seaweed_volume::version::set_runtime_rdma_policy(&read_policy);
+                #[cfg(feature = "rdma")]
                 let listener = RcReadListener::bind(
                     source,
                     RcReadListenerConfig {
                         listen_addr,
+                        read_policy: Some(read_policy),
                         ..RcReadListenerConfig::default()
                     },
                 )
@@ -569,11 +578,16 @@ async fn run(
                     )
                 })?;
                 #[cfg(feature = "rdma")]
+                seaweed_volume::rdma_stats::set_rc_buffer_pool(Arc::clone(listener.buffer_pool()));
+                #[cfg(feature = "rdma")]
                 let bound = listener
                     .local_addr()
                     .map_err(|e| format!("Failed to read RDMA RC listener address: {}", e))?;
                 #[cfg(feature = "rdma")]
-                info!("RDMA RC read listener serving on {}", bound);
+                info!(
+                    scheduler = config.rdma_scheduler.to_scheduler_kind().as_str(),
+                    "RDMA RC read listener serving on {}", bound
+                );
 
                 #[cfg(feature = "rdma")]
                 let mut rdma_shutdown = shutdown_tx.subscribe();

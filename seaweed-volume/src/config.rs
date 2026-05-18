@@ -204,12 +204,34 @@ pub struct Cli {
     /// `rc` uses real RDMA WRITE through seaweed-rdma.
     #[arg(long = "rdma-transport", value_enum, default_value_t = RdmaTransport::Tcp)]
     pub rdma_transport: RdmaTransport,
+
+    /// RDMA admission scheduler policy. `v1` preserves the current large-window
+    /// gate; `sliding-lane` lets large windows use the pool by slot budget.
+    #[arg(long = "rdma-scheduler", value_enum, default_value_t = RdmaScheduler::SlidingLane)]
+    pub rdma_scheduler: RdmaScheduler,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum RdmaTransport {
     Tcp,
     Rc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RdmaScheduler {
+    #[value(name = "v1")]
+    V1,
+    #[value(name = "sliding-lane")]
+    SlidingLane,
+}
+
+impl RdmaScheduler {
+    pub fn to_scheduler_kind(self) -> seaweed_rdma::SchedulerKind {
+        match self {
+            Self::V1 => seaweed_rdma::SchedulerKind::None,
+            Self::SlidingLane => seaweed_rdma::SchedulerKind::SlidingWindowLane,
+        }
+    }
 }
 
 /// Resolved configuration after applying defaults and validation.
@@ -283,6 +305,8 @@ pub struct VolumeServerConfig {
     pub rdma_max_inflight: usize,
     /// RDMA listener transport.
     pub rdma_transport: RdmaTransport,
+    /// RDMA admission scheduler policy.
+    pub rdma_scheduler: RdmaScheduler,
 }
 
 pub use crate::storage::needle_map::NeedleMapKind;
@@ -832,6 +856,7 @@ fn resolve_config(cli: Cli) -> VolumeServerConfig {
         rdma_listen: cli.rdma_listen,
         rdma_max_inflight: cli.rdma_max_inflight.get(),
         rdma_transport: cli.rdma_transport,
+        rdma_scheduler: cli.rdma_scheduler,
     }
 }
 
@@ -1437,6 +1462,7 @@ mod tests {
         assert_eq!(cfg.rdma_listen, "127.0.0.1:18515");
         assert_eq!(cfg.rdma_max_inflight, 32);
         assert_eq!(cfg.rdma_transport, RdmaTransport::Tcp);
+        assert_eq!(cfg.rdma_scheduler, RdmaScheduler::SlidingLane);
     }
 
     #[test]
@@ -1452,6 +1478,38 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_config_parses_rdma_scheduler_sliding_lane() {
+        let cfg = resolve_config(Cli::parse_from([
+            "bin",
+            "--rdma-listen",
+            "127.0.0.1:18515",
+            "--rdma-scheduler",
+            "sliding-lane",
+        ]));
+        assert_eq!(cfg.rdma_scheduler, RdmaScheduler::SlidingLane);
+        assert_eq!(
+            cfg.rdma_scheduler.to_scheduler_kind(),
+            seaweed_rdma::SchedulerKind::SlidingWindowLane
+        );
+    }
+
+    #[test]
+    fn test_resolve_config_parses_rdma_scheduler_v1_compat() {
+        let cfg = resolve_config(Cli::parse_from([
+            "bin",
+            "--rdma-listen",
+            "127.0.0.1:18515",
+            "--rdma-scheduler",
+            "v1",
+        ]));
+        assert_eq!(cfg.rdma_scheduler, RdmaScheduler::V1);
+        assert_eq!(
+            cfg.rdma_scheduler.to_scheduler_kind(),
+            seaweed_rdma::SchedulerKind::None
+        );
+    }
+
+    #[test]
     fn test_rdma_max_inflight_rejects_zero() {
         assert!(Cli::try_parse_from(["bin", "--rdma-max-inflight", "0"]).is_err());
     }
@@ -1464,6 +1522,7 @@ mod tests {
             "127.0.0.1:18515".into(),
             "-rdma-max-inflight=8".into(),
             "-rdma-transport=rc".into(),
+            "-rdma-scheduler=sliding-lane".into(),
         ];
         let norm = normalize_args_vec(args);
         assert_eq!(
@@ -1474,6 +1533,7 @@ mod tests {
                 "127.0.0.1:18515",
                 "--rdma-max-inflight=8",
                 "--rdma-transport=rc",
+                "--rdma-scheduler=sliding-lane",
             ]
         );
     }
@@ -1483,7 +1543,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
             tmp.path(),
-            "rdma-listen=127.0.0.1:18515\nrdma-max-inflight=64\nrdma-transport=rc\n",
+            "rdma-listen=127.0.0.1:18515\nrdma-max-inflight=64\nrdma-transport=rc\nrdma-scheduler=sliding-lane\n",
         )
         .unwrap();
         let args = normalize_args_vec(vec![
@@ -1497,6 +1557,7 @@ mod tests {
         assert_eq!(cfg.rdma_listen, "127.0.0.1:18515");
         assert_eq!(cfg.rdma_max_inflight, 8);
         assert_eq!(cfg.rdma_transport, RdmaTransport::Rc);
+        assert_eq!(cfg.rdma_scheduler, RdmaScheduler::SlidingLane);
     }
 
     #[test]

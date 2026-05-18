@@ -2,6 +2,8 @@
 
 use std::sync::OnceLock;
 
+static RUNTIME_RDMA_POLICY: OnceLock<(String, &'static str)> = OnceLock::new();
+
 #[cfg(feature = "5bytes")]
 const SIZE_LIMIT: &str = "8000GB"; // Matches Go production builds (5BytesOffset)
 #[cfg(not(feature = "5bytes"))]
@@ -89,10 +91,27 @@ pub fn rdma_transports() -> Vec<&'static str> {
 }
 
 pub fn default_rdma_policy_fingerprint() -> String {
-    seaweed_rdma::RdmaReadPolicy::for_pool(4 * 1024 * 1024, 64).fingerprint()
+    seaweed_rdma::RdmaReadPolicy::for_pool_with_scheduler(
+        4 * 1024 * 1024,
+        64,
+        seaweed_rdma::SchedulerKind::SlidingWindowLane,
+    )
+    .fingerprint()
+}
+
+pub fn set_runtime_rdma_policy(policy: &seaweed_rdma::RdmaReadPolicy) {
+    let _ = RUNTIME_RDMA_POLICY.set((policy.fingerprint(), policy.scheduler.kind.as_str()));
+}
+
+fn runtime_rdma_policy() -> (String, &'static str) {
+    RUNTIME_RDMA_POLICY
+        .get()
+        .cloned()
+        .unwrap_or_else(|| (default_rdma_policy_fingerprint(), "sliding-lane"))
 }
 
 pub fn sra_version_json() -> serde_json::Value {
+    let (policy_fingerprint, rdma_scheduler) = runtime_rdma_policy();
     serde_json::json!({
         "service": "weed-volume",
         "git_sha": build_git_sha(),
@@ -104,7 +123,8 @@ pub fn sra_version_json() -> serde_json::Value {
         "features": enabled_features(),
         "rdma_transports": rdma_transports(),
         "wire_protocol_version": seaweed_rdma::sra_hello::PROTOCOL_VERSION,
-        "policy_fingerprint": default_rdma_policy_fingerprint(),
+        "policy_fingerprint": policy_fingerprint,
+        "rdma_scheduler": rdma_scheduler,
     })
 }
 
@@ -151,6 +171,7 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("fnv64:"));
+        assert_eq!(value["rdma_scheduler"], "sliding-lane");
     }
 }
 

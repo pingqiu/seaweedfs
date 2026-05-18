@@ -2998,6 +2998,10 @@ pub async fn sra_version_handler() -> Response {
     axum::Json(crate::version::sra_version_json()).into_response()
 }
 
+pub async fn sra_rdma_stats_handler() -> Response {
+    axum::Json(crate::rdma_stats::rdma_stats_json()).into_response()
+}
+
 // ============================================================================
 // Metrics Handler
 // ============================================================================

@@ -171,6 +171,7 @@ mod tests {
             rdma_listen: String::new(),
             rdma_max_inflight: 256,
             rdma_transport: RdmaTransport::Tcp,
+            rdma_scheduler: crate::config::RdmaScheduler::SlidingLane,
         }
     }
 

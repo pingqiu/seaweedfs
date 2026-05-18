@@ -389,6 +389,7 @@ pub fn build_admin_router_with_ui(state: Arc<VolumeServerState>, ui_enabled: boo
         .route("/status", get(handlers::status_handler))
         .route("/healthz", get(handlers::healthz_handler))
         .route("/sra/version", get(handlers::sra_version_handler))
+        .route("/sra/rdma/stats", get(handlers::sra_rdma_stats_handler))
         .route("/favicon.ico", get(handlers::favicon_handler))
         .route(
             "/seaweedfsstatic/*path",
