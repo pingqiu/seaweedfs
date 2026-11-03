@@ -6318,7 +6318,7 @@ mod tests {
     /// Held by every EC marker test. They share the marker's log callsite, whose
     /// enabled state tracing caches process-wide, so the log test can only rely
     /// on it while no other marker test runs.
-    static EC_MARKER_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static EC_MARKER_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     async fn read_ec(
         state: &Arc<VolumeServerState>,
@@ -6342,7 +6342,7 @@ mod tests {
     /// A read whose shards are all mounted reads them directly and isn't marked.
     #[tokio::test]
     async fn test_ec_degraded_read_not_marked_for_a_direct_read() {
-        let _serial = EC_MARKER_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = EC_MARKER_TESTS.lock().await;
         use crate::server::store_ec::EcReadReason;
         let tmp = tempfile::TempDir::new().unwrap();
         let state = volume_test_state(&tmp);
@@ -6359,7 +6359,7 @@ mod tests {
     /// read/ok mark, and the bytes are exact.
     #[tokio::test]
     async fn test_ec_degraded_read_marks_a_reconstructed_read() {
-        let _serial = EC_MARKER_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = EC_MARKER_TESTS.lock().await;
         use crate::server::store_ec::EcReadReason;
         let tmp = tempfile::TempDir::new().unwrap();
         let state = volume_test_state(&tmp);
@@ -6375,7 +6375,7 @@ mod tests {
     /// With fewer than ten shards the reconstruction fails: read/fail only.
     #[tokio::test]
     async fn test_ec_degraded_read_marks_a_failed_reconstruction() {
-        let _serial = EC_MARKER_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = EC_MARKER_TESTS.lock().await;
         use crate::server::store_ec::EcReadReason;
         let tmp = tempfile::TempDir::new().unwrap();
         let state = volume_test_state(&tmp);
@@ -6399,7 +6399,7 @@ mod tests {
     /// A delete's read and an admin status read are marked as theirs, not read.
     #[tokio::test]
     async fn test_ec_degraded_read_marks_delete_and_admin_reads_by_reason() {
-        let _serial = EC_MARKER_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = EC_MARKER_TESTS.lock().await;
         use crate::server::store_ec::EcReadReason;
         let tmp = tempfile::TempDir::new().unwrap();
         let state = volume_test_state(&tmp);
@@ -6423,7 +6423,7 @@ mod tests {
     /// don't parse, and read/ok again for the dropped-input one that does.
     #[tokio::test]
     async fn test_ec_degraded_read_marks_a_dropped_input_rebuild() {
-        let _serial = EC_MARKER_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = EC_MARKER_TESTS.lock().await;
         use crate::server::store_ec::EcReadReason;
         use std::os::unix::fs::FileExt;
         let tmp = tempfile::TempDir::new().unwrap();
@@ -6455,7 +6455,7 @@ mod tests {
     /// A READS scrub that rebuilds what it can't read is marked scrub, not read.
     #[tokio::test]
     async fn test_ec_degraded_read_marks_a_scrub_as_scrub() {
-        let _serial = EC_MARKER_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = EC_MARKER_TESTS.lock().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let state = volume_test_state(&tmp);
         put_ec_needle(&state, &tmp, 65, b"ec degraded read marker", &[0]);
@@ -6512,7 +6512,7 @@ mod tests {
     /// info, the default.
     #[tokio::test]
     async fn test_ec_degraded_read_log_line() {
-        let _serial = EC_MARKER_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = EC_MARKER_TESTS.lock().await;
         use crate::server::store_ec::EcReadReason;
         async fn logged(level: tracing::Level, vid: u32) -> (NeedleId, String) {
             let tmp = tempfile::TempDir::new().unwrap();
