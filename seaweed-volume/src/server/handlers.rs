@@ -3472,9 +3472,14 @@ pub async fn delete_handler(
             //
             // No store guard is held across this call: the reader takes and
             // releases its own, and `RwLockReadGuard` is `!Send`.
-            let ec_read_result =
-                crate::server::store_ec::read_ec_shard_needle_distributed(&state, vid, needle_id)
-                    .await;
+            let ec_read_result = crate::server::store_ec::read_ec_shard_needle_or_miss_for(
+                &state,
+                vid,
+                needle_id,
+                crate::server::store_ec::EcReadReason::Delete,
+            )
+            .await
+            .map(Result::ok);
             match ec_read_result {
                 Ok(Some(ec_needle)) => {
                     // Step 2: Validate cookie (Go: cookie != 0 && cookie != n.Cookie)
@@ -6228,6 +6233,378 @@ mod tests {
             n.set_is_chunk_manifest();
             n.set_is_compressed();
         })
+    }
+
+    /// Writes one needle to a fresh volume `vid`, EC-encodes it 10+4, and mounts
+    /// every shard but those in `missing`. The needle is small, so it lies on
+    /// shard 0.
+    fn put_ec_needle(
+        state: &VolumeServerState,
+        tmp: &tempfile::TempDir,
+        vid: u32,
+        data: &[u8],
+        missing: &[crate::storage::erasure_coding::ec_shard::ShardId],
+    ) -> NeedleId {
+        put_ec_needle_at(state, tmp, vid, data, missing, 0)
+    }
+
+    /// `put_ec_needle` with the encode generation `encode_ts_ns` stamped in the
+    /// .vif before the shards mount.
+    fn put_ec_needle_at(
+        state: &VolumeServerState,
+        tmp: &tempfile::TempDir,
+        vid: u32,
+        data: &[u8],
+        missing: &[crate::storage::erasure_coding::ec_shard::ShardId],
+        encode_ts_ns: i64,
+    ) -> NeedleId {
+        use crate::storage::erasure_coding::ec_encoder::write_ec_files;
+        use crate::storage::erasure_coding::ec_shard::ShardId;
+        use crate::storage::needle_map::NeedleMapKind;
+        use crate::storage::volume::{Volume, VolumeSpec};
+
+        let dir = tmp.path().to_str().unwrap();
+        let v = Volume::new(
+            dir,
+            dir,
+            VolumeId(vid),
+            NeedleMapKind::InMemory,
+            &VolumeSpec::default(),
+        )
+        .unwrap();
+        let mut n = Needle {
+            id: NeedleId(7),
+            cookie: Cookie(TEST_COOKIE),
+            data: data.to_vec(),
+            data_size: data.len() as u32,
+            ..Needle::default()
+        };
+        v.write_needle(&mut n, true, false).unwrap();
+        v.sync_to_disk().unwrap();
+        v.close();
+        let block_size = write_ec_files(dir, dir, "", VolumeId(vid), 10, 4).unwrap();
+        if encode_ts_ns != 0 {
+            // As the encode RPC records it: the shape, the block layout the
+            // shards were written in, and the generation.
+            let vif = format!("{dir}/{vid}.vif");
+            let mut info: crate::storage::volume::VifVolumeInfo =
+                serde_json::from_str(&std::fs::read_to_string(&vif).unwrap()).unwrap();
+            info.ec_shard_config = Some(crate::storage::volume::VifEcShardConfig {
+                data_shards: 10,
+                parity_shards: 4,
+                encode_ts_ns,
+                block_size,
+            });
+            crate::storage::store::save_vif_volume_info(&vif, &info).unwrap();
+        }
+        let mounted: Vec<ShardId> = (0..14).filter(|s| !missing.contains(s)).collect();
+        state
+            .store
+            .write()
+            .unwrap()
+            .mount_ec_shards(VolumeId(vid), "", &mounted)
+            .unwrap();
+        NeedleId(7)
+    }
+
+    /// Runs `f` and returns `vid`'s marks made meanwhile, as (reason, outcome)
+    /// counts. It also checks the real counter: for every label, its movement
+    /// equals all marks in the window, from any test, since each increment is
+    /// made under the lock its mark is recorded with.
+    async fn ec_marks_during<F: std::future::Future<Output = ()>>(
+        vid: u32,
+        f: F,
+    ) -> std::collections::BTreeMap<(&'static str, &'static str), usize> {
+        use crate::server::store_ec::ec_degraded_reads_for_test::snapshot;
+        let (marks_before, counter_before) = snapshot();
+        f.await;
+        let (marks_after, counter_after) = snapshot();
+        let window = &marks_after[marks_before.len()..];
+        for (((reason, outcome), after), (_, before)) in counter_after.iter().zip(&counter_before) {
+            let marked = window
+                .iter()
+                .filter(|(_, r, o)| r == reason && o == outcome)
+                .count() as u64;
+            assert_eq!(
+                after - before,
+                marked,
+                "ec_degraded_read_total{{reason={},result={outcome}}} moved {} times for {marked} marks",
+                reason.as_str(),
+                after - before
+            );
+        }
+        let mut own = std::collections::BTreeMap::new();
+        for (v, reason, outcome) in window {
+            if *v == VolumeId(vid) {
+                *own.entry((reason.as_str(), *outcome)).or_insert(0) += 1;
+            }
+        }
+        own
+    }
+
+    /// Held by every EC marker test. They share the marker's log callsite, whose
+    /// enabled state tracing caches process-wide, so the log test can only rely
+    /// on it while no other marker test runs.
+    static EC_MARKER_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn read_ec(
+        state: &Arc<VolumeServerState>,
+        vid: u32,
+        id: NeedleId,
+        reason: crate::server::store_ec::EcReadReason,
+    ) -> Option<Vec<u8>> {
+        crate::server::store_ec::read_ec_shard_needle_or_miss_for(state, VolumeId(vid), id, reason)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .map(|n| n.data)
+    }
+
+    fn marks(
+        pairs: &[((&'static str, &'static str), usize)],
+    ) -> std::collections::BTreeMap<(&'static str, &'static str), usize> {
+        pairs.iter().copied().collect()
+    }
+
+    /// A read whose shards are all mounted reads them directly and isn't marked.
+    #[tokio::test]
+    async fn test_ec_degraded_read_not_marked_for_a_direct_read() {
+        let _serial = EC_MARKER_TESTS.lock().await;
+        use crate::server::store_ec::EcReadReason;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = volume_test_state(&tmp);
+        let id = put_ec_needle(&state, &tmp, 61, b"ec degraded read marker", &[]);
+        let own = ec_marks_during(61, async {
+            let read = read_ec(&state, 61, id, EcReadReason::Read).await;
+            assert_eq!(read.as_deref(), Some(&b"ec degraded read marker"[..]));
+        })
+        .await;
+        assert_eq!(own, marks(&[]), "a direct read was marked as degraded");
+    }
+
+    /// With the needle's shard missing a client read reconstructs it: one
+    /// read/ok mark, and the bytes are exact.
+    #[tokio::test]
+    async fn test_ec_degraded_read_marks_a_reconstructed_read() {
+        let _serial = EC_MARKER_TESTS.lock().await;
+        use crate::server::store_ec::EcReadReason;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = volume_test_state(&tmp);
+        let id = put_ec_needle(&state, &tmp, 62, b"ec degraded read marker", &[0]);
+        let own = ec_marks_during(62, async {
+            let read = read_ec(&state, 62, id, EcReadReason::Read).await;
+            assert_eq!(read.as_deref(), Some(&b"ec degraded read marker"[..]));
+        })
+        .await;
+        assert_eq!(own, marks(&[(("read", "ok"), 1)]));
+    }
+
+    /// With fewer than ten shards the reconstruction fails: read/fail only.
+    #[tokio::test]
+    async fn test_ec_degraded_read_marks_a_failed_reconstruction() {
+        let _serial = EC_MARKER_TESTS.lock().await;
+        use crate::server::store_ec::EcReadReason;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = volume_test_state(&tmp);
+        let id = put_ec_needle(
+            &state,
+            &tmp,
+            63,
+            b"ec degraded read marker",
+            &[0, 6, 7, 8, 9, 10, 11, 12, 13],
+        );
+        let own = ec_marks_during(63, async {
+            assert!(read_ec(&state, 63, id, EcReadReason::Read).await.is_none());
+        })
+        .await;
+        assert_eq!(own, marks(&[(("read", "fail"), 1)]));
+    }
+
+    /// A delete's read and an admin status read are marked as theirs, not read.
+    #[tokio::test]
+    async fn test_ec_degraded_read_marks_delete_and_admin_reads_by_reason() {
+        let _serial = EC_MARKER_TESTS.lock().await;
+        use crate::server::store_ec::EcReadReason;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = volume_test_state(&tmp);
+        let id = put_ec_needle(&state, &tmp, 64, b"ec degraded read marker", &[0]);
+        let own = ec_marks_during(64, async {
+            assert!(
+                read_ec(&state, 64, id, EcReadReason::Delete)
+                    .await
+                    .is_some()
+            );
+            assert!(read_ec(&state, 64, id, EcReadReason::Admin).await.is_some());
+        })
+        .await;
+        assert_eq!(own, marks(&[(("admin", "ok"), 1), (("delete", "ok"), 1)]));
+    }
+
+    /// A needle whose data shard and one parity shard are both corrupt can't be
+    /// repaired by rebuilding its own interval: the rebuild reads the bad parity
+    /// as input. The rebuild that drops one input at a time repairs it, and that
+    /// reconstruction is marked too: read/ok for the first rebuild, whose bytes
+    /// don't parse, and read/ok again for the dropped-input one that does.
+    #[tokio::test]
+    async fn test_ec_degraded_read_marks_a_dropped_input_rebuild() {
+        let _serial = EC_MARKER_TESTS.lock().await;
+        use crate::server::store_ec::EcReadReason;
+        use std::os::unix::fs::FileExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = volume_test_state(&tmp);
+        let data = vec![0x5au8; 900];
+        let id = put_ec_needle(&state, &tmp, 68, &data, &[]);
+        let dir = tmp.path().to_str().unwrap();
+        // The needle lies at the start of shard 0's first block, after the
+        // 8-byte super block; damage its data in shard 0 and in parity shard 10.
+        for shard in [0, 10] {
+            let shard_file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(format!("{dir}/68.ec{shard:02}"))
+                .unwrap();
+            shard_file.write_all_at(&[0xffu8; 64], 8 + 40).unwrap();
+        }
+        let own = ec_marks_during(68, async {
+            let read = read_ec(&state, 68, id, EcReadReason::Read).await;
+            assert_eq!(
+                read.as_deref(),
+                Some(&data[..]),
+                "the needle was not repaired"
+            );
+        })
+        .await;
+        assert_eq!(own, marks(&[(("read", "ok"), 2)]));
+    }
+
+    /// A READS scrub that rebuilds what it can't read is marked scrub, not read.
+    #[tokio::test]
+    async fn test_ec_degraded_read_marks_a_scrub_as_scrub() {
+        let _serial = EC_MARKER_TESTS.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = volume_test_state(&tmp);
+        put_ec_needle(&state, &tmp, 65, b"ec degraded read marker", &[0]);
+        // A fresh location map without shard 0, so the scrub asks no master and
+        // rebuilds shard 0 from the mounted shards.
+        let locations = (1..14)
+            .map(|sid| (sid, vec!["127.0.0.1:1".to_string()]))
+            .collect();
+        state
+            .store
+            .read()
+            .unwrap()
+            .find_ec_volume(VolumeId(65))
+            .unwrap()
+            .merge_shard_locations(locations);
+        let own = ec_marks_during(65, async {
+            let (_, _, errs) = crate::server::store_ec::scrub_ec_volume_distributed(
+                &state,
+                VolumeId(65),
+                0,
+                false,
+                true,
+            )
+            .await;
+            assert!(errs.is_empty(), "scrub: {errs:?}");
+        })
+        .await;
+        assert_eq!(own, marks(&[(("scrub", "ok"), 1)]));
+    }
+
+    /// A writer the debug line can be captured with.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The line an operator or a harness reads names volume, generation, needle,
+    /// shard, available shards, reason and result at debug, and is absent at
+    /// info, the default.
+    #[tokio::test]
+    async fn test_ec_degraded_read_log_line() {
+        let _serial = EC_MARKER_TESTS.lock().await;
+        use crate::server::store_ec::EcReadReason;
+        const GENERATION: i64 = 1_700_000_000_123_456_789;
+        async fn logged(
+            level: tracing::Level,
+            vid: u32,
+            missing: &[crate::storage::erasure_coding::ec_shard::ShardId],
+        ) -> (NeedleId, String) {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let state = volume_test_state(&tmp);
+            let id = put_ec_needle_at(
+                &state,
+                &tmp,
+                vid,
+                b"ec degraded read marker",
+                missing,
+                GENERATION,
+            );
+            let out = Captured::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(level)
+                .with_ansi(false)
+                .with_writer(out.clone())
+                .finish();
+            let guard = tracing::subscriber::set_default(subscriber);
+            // Another test may have reached this callsite first with no
+            // subscriber and cached it as never enabled.
+            tracing::callsite::rebuild_interest_cache();
+            let read = read_ec(&state, vid, id, EcReadReason::Read).await;
+            assert_eq!(
+                read.is_some(),
+                missing.len() == 1,
+                "read with {missing:?} missing"
+            );
+            drop(guard);
+            let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+            let markers: Vec<&str> = text
+                .lines()
+                .filter(|l| l.contains("ec degraded read:"))
+                .collect();
+            (id, markers.join("\n"))
+        }
+        let (id, markers) = logged(tracing::Level::DEBUG, 66, &[0]).await;
+        let want = format!(
+            "ec degraded read: volume=66 generation={GENERATION} needle={id} shard=0 available=10/10 reason=read result=ok error=-"
+        );
+        assert!(
+            markers.ends_with(&want) && markers.matches("ec degraded read:").count() == 1,
+            "at debug the marker is {markers:?}, want one line ending {want:?}"
+        );
+        let missing = [0, 6, 7, 8, 9, 10, 11, 12, 13];
+        let (id, markers) = logged(tracing::Level::DEBUG, 69, &missing).await;
+        let want = format!(
+            "ec degraded read: volume=69 generation={GENERATION} needle={id} shard=0 available=5/10 reason=read result=fail error="
+        );
+        let lines: Vec<&str> = markers.lines().collect();
+        assert!(
+            lines.len() == 1
+                && lines.iter().all(|l| {
+                    let error = l.split_once(" error=").map_or("", |(_, e)| e.trim());
+                    l.contains(&want) && !error.is_empty() && error != "-"
+                }),
+            "at debug the failure markers are {markers:?}, want 1 line with {want:?} and an error"
+        );
+        let (_, markers) = logged(tracing::Level::INFO, 67, &[0]).await;
+        assert!(
+            markers.is_empty(),
+            "at info the marker was logged: {markers:?}"
+        );
     }
 
     /// Write `data` as a chunk manifest on a fresh EC volume 2. Chunks stay on volume 1.

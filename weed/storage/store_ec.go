@@ -531,7 +531,24 @@ func (s *Store) UnloadEcVolume(vid needle.VolumeId) {
 	}
 }
 
+// EcReadReason says why an EC needle is read; it labels the reconstructions
+// the read causes, so a client's degraded read can be told from a scrub's.
+type EcReadReason string
+
+const (
+	EcReadForClient EcReadReason = "read"
+	EcReadForScrub  EcReadReason = "scrub"
+	EcReadForDelete EcReadReason = "delete"
+	EcReadForAdmin  EcReadReason = "admin"
+)
+
 func (s *Store) ReadEcShardNeedle(vid needle.VolumeId, n *needle.Needle, onReadSizeFn func(size types.Size)) (int, error) {
+	return s.ReadEcShardNeedleFor(EcReadForClient, vid, n, onReadSizeFn)
+}
+
+// ReadEcShardNeedleFor is ReadEcShardNeedle for a caller other than a client
+// read, named by reason.
+func (s *Store) ReadEcShardNeedleFor(reason EcReadReason, vid needle.VolumeId, n *needle.Needle, onReadSizeFn func(size types.Size)) (int, error) {
 	for _, location := range s.Locations {
 		if localEcVolume, found := location.FindEcVolume(vid); found {
 
@@ -555,7 +572,7 @@ func (s *Store) ReadEcShardNeedle(vid needle.VolumeId, n *needle.Needle, onReadS
 			// ReadBytes re-reads the id out of a possibly corrupt header, so the
 			// requested id is kept aside for the rebuild path to recover under.
 			needleId := n.Id
-			bytes, isDeleted, err := s.readEcShardIntervals(needleId, localEcVolume, intervals)
+			bytes, isDeleted, err := s.readEcShardIntervals(reason, needleId, localEcVolume, intervals)
 			// A holder reporting the needle deleted is authoritative -- deletes are
 			// never invented and never undone -- so answer that ahead of whatever
 			// error the shards it could not gather produced.
@@ -568,7 +585,7 @@ func (s *Store) ReadEcShardNeedle(vid needle.VolumeId, n *needle.Needle, onReadS
 
 			err = n.ReadBytes(bytes, offset.ToActualOffset(), size, localEcVolume.Version)
 			if err != nil {
-				if rebuilt, isDeleted := s.rebuildEcShardNeedle(n, needleId, localEcVolume, intervals, offset.ToActualOffset(), size, bytes); isDeleted {
+				if rebuilt, isDeleted := s.rebuildEcShardNeedle(reason, n, needleId, localEcVolume, intervals, offset.ToActualOffset(), size, bytes); isDeleted {
 					return 0, ErrorDeleted
 				} else if rebuilt != nil {
 					return len(rebuilt), nil
@@ -596,7 +613,7 @@ var (
 // spanning several of them costs one round trip per block when read in sequence.
 const ecIntervalReadConcurrency = 8
 
-func (s *Store) readEcShardIntervals(needleId types.NeedleId, ecVolume *erasure_coding.EcVolume, intervals []erasure_coding.Interval) (data []byte, is_deleted bool, err error) {
+func (s *Store) readEcShardIntervals(reason EcReadReason, needleId types.NeedleId, ecVolume *erasure_coding.EcVolume, intervals []erasure_coding.Interval) (data []byte, is_deleted bool, err error) {
 	if err = s.cachedLookupEcShardLocations(ecVolume); err != nil {
 		return nil, false, fmt.Errorf("failed to locate shard via master grpc %s: %v", s.masterAddress(), err)
 	}
@@ -609,7 +626,7 @@ func (s *Store) readEcShardIntervals(needleId types.NeedleId, ecVolume *erasure_
 
 	if len(intervals) <= 1 {
 		for _, interval := range intervals {
-			if is_deleted, err = s.readOneEcShardInterval(needleId, ecVolume, interval, data); err != nil {
+			if is_deleted, err = s.readOneEcShardInterval(reason, needleId, ecVolume, interval, data); err != nil {
 				return nil, is_deleted, err
 			}
 		}
@@ -629,7 +646,7 @@ func (s *Store) readEcShardIntervals(needleId types.NeedleId, ecVolume *erasure_
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			isDeleted, e := s.readOneEcShardInterval(needleId, ecVolume, interval, buf)
+			isDeleted, e := s.readOneEcShardInterval(reason, needleId, ecVolume, interval, buf)
 			if isDeleted {
 				deleted.Store(true)
 			}
@@ -648,7 +665,7 @@ func (s *Store) readEcShardIntervals(needleId types.NeedleId, ecVolume *erasure_
 }
 
 // readOneEcShardInterval fills data, which must be interval.Size long.
-func (s *Store) readOneEcShardInterval(needleId types.NeedleId, ecVolume *erasure_coding.EcVolume, interval erasure_coding.Interval, data []byte) (is_deleted bool, err error) {
+func (s *Store) readOneEcShardInterval(reason EcReadReason, needleId types.NeedleId, ecVolume *erasure_coding.EcVolume, interval erasure_coding.Interval, data []byte) (is_deleted bool, err error) {
 	shardId, actualOffset := ecVolume.IntervalToShardIdAndOffset(interval)
 
 	// try local read
@@ -681,7 +698,7 @@ func (s *Store) readOneEcShardInterval(needleId types.NeedleId, ecVolume *erasur
 	}
 
 	// try reading by recovering from other shards
-	_, is_deleted, err = s.recoverOneRemoteEcShardInterval(needleId, ecVolume, shardId, data, actualOffset)
+	_, is_deleted, err = s.recoverOneRemoteEcShardInterval(reason, needleId, ecVolume, shardId, data, actualOffset)
 	if err == nil {
 		return
 	}
@@ -701,7 +718,7 @@ func (s *Store) readOneEcShardInterval(needleId types.NeedleId, ecVolume *erasur
 // hypothesis parses (index or needle corrupt in all shards alike). A deleted
 // report from a holder stops the search: deletes are never invented, so the
 // needle is gone whatever the local index says.
-func (s *Store) rebuildEcShardNeedle(n *needle.Needle, needleId types.NeedleId, ecVolume *erasure_coding.EcVolume, intervals []erasure_coding.Interval, offset int64, size types.Size, corrupted []byte) ([]byte, bool) {
+func (s *Store) rebuildEcShardNeedle(reason EcReadReason, n *needle.Needle, needleId types.NeedleId, ecVolume *erasure_coding.EcVolume, intervals []erasure_coding.Interval, offset int64, size types.Size, corrupted []byte) ([]byte, bool) {
 	ecCtx := ecVolume.ECContext
 	if ecCtx == nil {
 		ecCtx = erasure_coding.NewDefaultECContext(ecVolume.Collection, ecVolume.VolumeId)
@@ -725,7 +742,7 @@ func (s *Store) rebuildEcShardNeedle(n *needle.Needle, needleId types.NeedleId, 
 				copy(buf, corrupted[pos-int(interval.Size):pos])
 				continue
 			}
-			_, isDeleted, err := s.recoverEcShardInterval(needleId, ecVolume, shardIds[i], buf, offsets[i], exclude)
+			_, isDeleted, err := s.recoverEcShardInterval(reason, needleId, ecVolume, shardIds[i], buf, offsets[i], exclude)
 			if isDeleted {
 				return nil, true
 			}
@@ -765,7 +782,7 @@ func (s *Store) rebuildEcShardNeedle(n *needle.Needle, needleId types.NeedleId, 
 		// corrupt shard as reconstruction input. With slack left in the parity
 		// budget, retry while dropping one gathered input at a time.
 		if len(suspects) < ecCtx.ParityShards {
-			if candidate, isDeleted := s.rebuildEcNeedleFromDroppedInputs(n, needleId, ecVolume, ecCtx, intervals, shardIds, offsets, offset, size, corrupted, suspects); isDeleted {
+			if candidate, isDeleted := s.rebuildEcNeedleFromDroppedInputs(reason, n, needleId, ecVolume, ecCtx, intervals, shardIds, offsets, offset, size, corrupted, suspects); isDeleted {
 				return nil, true
 			} else if candidate != nil {
 				return candidate, false
@@ -793,7 +810,7 @@ func (s *Store) rebuildEcShardNeedle(n *needle.Needle, needleId types.NeedleId, 
 // dropped at a time and a needle parse arbitrates. The hypotheses tried are
 // the inputs the first decode consumed, the only shards whose corruption can
 // explain the failed candidate. Nil when no dropped-input subset parses.
-func (s *Store) rebuildEcNeedleFromDroppedInputs(n *needle.Needle, needleId types.NeedleId, ecVolume *erasure_coding.EcVolume, ecCtx *erasure_coding.ECContext, intervals []erasure_coding.Interval, shardIds []erasure_coding.ShardId, offsets []int64, offset int64, size types.Size, corrupted []byte, suspects map[erasure_coding.ShardId]bool) ([]byte, bool) {
+func (s *Store) rebuildEcNeedleFromDroppedInputs(reason EcReadReason, n *needle.Needle, needleId types.NeedleId, ecVolume *erasure_coding.EcVolume, ecCtx *erasure_coding.ECContext, intervals []erasure_coding.Interval, shardIds []erasure_coding.ShardId, offsets []int64, offset int64, size types.Size, corrupted []byte, suspects map[erasure_coding.ShardId]bool) ([]byte, bool) {
 	var totalSize int64
 	for _, interval := range intervals {
 		totalSize += int64(interval.Size)
@@ -849,6 +866,9 @@ func (s *Store) rebuildEcNeedleFromDroppedInputs(n *needle.Needle, needleId type
 		if check.ReadBytes(candidate, offset, size, ecVolume.Version) != nil || check.Id != needleId {
 			continue
 		}
+		for i := range intervals {
+			noteEcDegradedRead(reason, ecVolume, needleId, shardIds[i], gatheredShards(gathers[i], int(drop)), nil)
+		}
 		// The verdict convicts every differing range — and the dropped input,
 		// without which the same decode kept failing to parse.
 		pos = 0
@@ -862,7 +882,25 @@ func (s *Store) rebuildEcNeedleFromDroppedInputs(n *needle.Needle, needleId type
 		*n = *check
 		return candidate, false
 	}
+	for i := range intervals {
+		noteEcDegradedRead(reason, ecVolume, needleId, shardIds[i], gatheredShards(gathers[i], -1), errNoDroppedInputParses)
+	}
 	return nil, false
+}
+
+// errNoDroppedInputParses is the marked outcome of a dropped-input rebuild in
+// which no hypothesis produced a needle that parses.
+var errNoDroppedInputParses = errors.New("no dropped-input reconstruction parses")
+
+// gatheredShards counts the gathered shard intervals, less the one at drop;
+// -1 drops none.
+func gatheredShards(gathered [][]byte, drop int) (n int) {
+	for shardId, shardInterval := range gathered {
+		if shardInterval != nil && shardId != drop {
+			n++
+		}
+	}
+	return n
 }
 
 func forgetShardId(ecVolume *erasure_coding.EcVolume, shardId erasure_coding.ShardId) {
@@ -1215,14 +1253,16 @@ func reconstructEcShardInterval(ecVolume *erasure_coding.EcVolume, ecCtx *erasur
 	return nil
 }
 
-func (s *Store) recoverOneRemoteEcShardInterval(needleId types.NeedleId, ecVolume *erasure_coding.EcVolume, shardIdToRecover erasure_coding.ShardId, buf []byte, offset int64) (n int, is_deleted bool, err error) {
-	return s.recoverEcShardInterval(needleId, ecVolume, shardIdToRecover, buf, offset, map[erasure_coding.ShardId]bool{shardIdToRecover: true})
+func (s *Store) recoverOneRemoteEcShardInterval(reason EcReadReason, needleId types.NeedleId, ecVolume *erasure_coding.EcVolume, shardIdToRecover erasure_coding.ShardId, buf []byte, offset int64) (n int, is_deleted bool, err error) {
+	return s.recoverEcShardInterval(reason, needleId, ecVolume, shardIdToRecover, buf, offset, map[erasure_coding.ShardId]bool{shardIdToRecover: true})
 }
 
 // recoverEcShardInterval rebuilds shardIdToRecover's interval from the shards
 // outside exclude, which always contains shardIdToRecover itself.
-func (s *Store) recoverEcShardInterval(needleId types.NeedleId, ecVolume *erasure_coding.EcVolume, shardIdToRecover erasure_coding.ShardId, buf []byte, offset int64, exclude map[erasure_coding.ShardId]bool) (n int, is_deleted bool, err error) {
+func (s *Store) recoverEcShardInterval(reason EcReadReason, needleId types.NeedleId, ecVolume *erasure_coding.EcVolume, shardIdToRecover erasure_coding.ShardId, buf []byte, offset int64, exclude map[erasure_coding.ShardId]bool) (n int, is_deleted bool, err error) {
 	glog.V(3).Infof("recover ec shard %d.%d from other locations", ecVolume.VolumeId, shardIdToRecover)
+	available := 0
+	defer func() { noteEcDegradedRead(reason, ecVolume, needleId, shardIdToRecover, available, err) }()
 
 	// Reconstruct with the volume's OWN EC ratio (loaded from its .vif), not the
 	// build default, so a custom-ratio volume (e.g. 9+3) is decoded with the matrix
@@ -1254,6 +1294,11 @@ func (s *Store) recoverEcShardInterval(needleId types.NeedleId, ecVolume *erasur
 	defer ecRecoverSem.Release(weight)
 
 	shardIntervals, is_deleted := s.gatherEcShardIntervals(needleId, ecVolume, ecCtx, exclude, len(buf), offset, ecCtx.DataShards)
+	for _, shardInterval := range shardIntervals {
+		if shardInterval != nil {
+			available++
+		}
+	}
 	if err := reconstructEcShardInterval(ecVolume, ecCtx, shardIntervals, shardIdToRecover); err != nil {
 		return 0, is_deleted, err
 	}
@@ -1262,6 +1307,31 @@ func (s *Store) recoverEcShardInterval(needleId types.NeedleId, ecVolume *erasur
 	copy(buf, shardIntervals[shardIdToRecover])
 
 	return len(buf), is_deleted, nil
+}
+
+// noteEcDegradedRead marks one reconstructed shard interval: a counter by
+// reason and result, and at V(1) a line binding it to the volume, its encode
+// generation and the needle, which the counter can't carry. available is how
+// many shards were gathered, against the DataShards the reconstruction needs.
+func noteEcDegradedRead(reason EcReadReason, ecVolume *erasure_coding.EcVolume, needleId types.NeedleId, shardId erasure_coding.ShardId, available int, err error) {
+	result := "ok"
+	if err != nil {
+		result = "fail"
+	}
+	stats.VolumeServerECDegradedReadCounter.WithLabelValues(string(reason), result).Inc()
+	if !glog.V(1) {
+		return
+	}
+	need := erasure_coding.DataShardsCount
+	if ecVolume.ECContext != nil {
+		need = ecVolume.ECContext.DataShards
+	}
+	errText := "-"
+	if err != nil {
+		errText = err.Error()
+	}
+	glog.Infof("ec degraded read: volume=%d generation=%d needle=%s shard=%d available=%d/%d reason=%s result=%s error=%s",
+		ecVolume.VolumeId, ecVolume.EncodeTsNs, needleId, shardId, available, need, reason, result, errText)
 }
 
 func (s *Store) EcVolumes() (ecVolumes []*erasure_coding.EcVolume) {

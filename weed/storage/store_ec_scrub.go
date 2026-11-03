@@ -133,7 +133,7 @@ func (s *Store) scrubEcVolumeWalk(ecv *erasure_coding.EcVolume, mode volume_serv
 			// A holder reporting the needle deleted is authoritative, and it answers
 			// with no bytes: the chunk stays zeroed and reaches ReadBytes as the
 			// delete-state mismatch the walk below already tolerates.
-			if _, isDeleted, err := s.recoverOneRemoteEcShardInterval(id, ecv, shardId, chunk, offset); err != nil && !isDeleted {
+			if _, isDeleted, err := s.recoverOneRemoteEcShardInterval(EcReadForScrub, id, ecv, shardId, chunk, offset); err != nil && !isDeleted {
 				errs = append(errs, fmt.Errorf("failed to recover EC shard %d for needle %d on volume %d (interval %d/%d): %v", shardId, id, ecv.VolumeId, i+1, len(intervals), err))
 				break
 			}

@@ -223,7 +223,7 @@ func TestReadOneEcShardIntervalMarksTheMapAfterADirectReadFails(t *testing.T) {
 
 	interval := erasure_coding.Interval{BlockIndex: int(badShard), Size: 4096, IsLargeBlock: true}
 	got := make([]byte, interval.Size)
-	if _, err := store.readOneEcShardInterval(n.Id, ecVolume, interval, got); err != nil {
+	if _, err := store.readOneEcShardInterval(EcReadForClient, n.Id, ecVolume, interval, got); err != nil {
 		t.Fatalf("read interval: %v", err)
 	}
 
