@@ -126,6 +126,17 @@ pub async fn read_ec_shard_needle_or_miss(
     vid: VolumeId,
     needle_id: NeedleId,
 ) -> io::Result<Result<Needle, EcMiss>> {
+    read_ec_shard_needle_or_miss_for(state, vid, needle_id, EcReadReason::Read).await
+}
+
+/// `read_ec_shard_needle_or_miss` for a caller other than a client read, named
+/// by `reason`.
+pub async fn read_ec_shard_needle_or_miss_for(
+    state: &Arc<VolumeServerState>,
+    vid: VolumeId,
+    needle_id: NeedleId,
+    reason: EcReadReason,
+) -> io::Result<Result<Needle, EcMiss>> {
     // Phase A — under the Store read lock, locate the needle, compute
     // intervals, and read any locally-mounted shard intervals. We must
     // not `.await` while holding this guard (std::sync::RwLockReadGuard
@@ -134,6 +145,9 @@ pub async fn read_ec_shard_needle_or_miss(
         Ok(s) => s,
         Err(miss) => return Ok(Err(miss)),
     };
+    for meta in &mut snapshot.metas {
+        meta.reason = reason;
+    }
 
     // Phase B — refresh the shard_locations cache from the master if
     // it is stale. Do this lazily: if every needed interval was read
@@ -218,6 +232,7 @@ pub async fn read_ec_shard_needle_or_miss(
                                 shard_offset,
                                 size,
                                 expected_encode_ts_ns: encode_ts_ns,
+                                reason,
                             },
                             EcShardMap {
                                 locations: shard_locations,
@@ -853,6 +868,7 @@ pub async fn scrub_ec_volume_distributed(
                         shard_offset: *shard_offset,
                         size: *ssize,
                         expected_encode_ts_ns: snapshot.encode_ts_ns,
+                        reason: EcReadReason::Scrub,
                     };
                     match read_remote_ec_shard_interval(state, sources, iv).await {
                         // A deleted shard yields no bytes; zero-fill the interval so
@@ -1113,6 +1129,7 @@ fn build_snapshot(
                 shard_offset,
                 size: iv.size as usize,
                 expected_encode_ts_ns: ecv.encode_ts_ns,
+                reason: EcReadReason::Read,
             }
         })
         .collect();
@@ -1312,6 +1329,29 @@ struct EcInterval {
     /// Encode run the caller expects the shard to belong to; 0 accepts any,
     /// for peers that predate the identity check.
     expected_encode_ts_ns: i64,
+    /// Why the needle is read; it labels any reconstruction of this interval.
+    reason: EcReadReason,
+}
+
+/// Why an EC needle is read. It labels the reconstructions the read causes, so
+/// a client's degraded read can be told from a scrub's. Go: `EcReadReason`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EcReadReason {
+    Read,
+    Scrub,
+    Delete,
+    Admin,
+}
+
+impl EcReadReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EcReadReason::Read => "read",
+            EcReadReason::Scrub => "scrub",
+            EcReadReason::Delete => "delete",
+            EcReadReason::Admin => "admin",
+        }
+    }
 }
 
 /// Where the shards of one EC volume can be fetched from, and the volume's
@@ -1391,6 +1431,7 @@ async fn do_read_remote_ec_shard_interval(
         shard_offset,
         size,
         expected_encode_ts_ns,
+        ..
     } = iv;
     let grpc_addr =
         parse_grpc_address(source).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -1643,10 +1684,10 @@ async fn recover_one_remote_ec_shard_interval(
     result
 }
 
-/// Marks one reconstructed read: a counter by result, and a debug line binding
-/// it to the volume, the encode generation and the needle, which the counter
-/// can't carry. It's `ok` only when the interval was rebuilt; a holder's
-/// deleted report with too few shards counts as `fail`, as in Go.
+/// Marks one reconstructed shard interval: a counter by reason and result, and
+/// a debug line binding it to the volume, the encode generation and the needle,
+/// which the counter can't carry. It's `ok` only when the interval was rebuilt;
+/// a holder's deleted report with too few shards counts as `fail`, as in Go.
 fn note_ec_degraded_read(
     iv: EcInterval,
     data_shards: usize,
@@ -1654,56 +1695,100 @@ fn note_ec_degraded_read(
     result: &io::Result<(Vec<u8>, bool)>,
 ) {
     let ok = result.is_ok() && available >= data_shards;
-    let outcome = if ok { "ok" } else { "fail" };
-    crate::metrics::EC_DEGRADED_READ_COUNTER
-        .with_label_values(&[outcome])
-        .inc();
+    let error = match result {
+        Err(e) => Some(e.to_string()),
+        Ok(_) if !ok => Some(format!(
+            "only {available} shards, a holder reported the needle deleted"
+        )),
+        Ok(_) => None,
+    };
+    mark_ec_degraded_read(iv, data_shards, available, error);
+}
+
+/// The counter and the line for one reconstruction; `error` is `None` when the
+/// interval was rebuilt.
+fn mark_ec_degraded_read(
+    iv: EcInterval,
+    data_shards: usize,
+    available: usize,
+    error: Option<String>,
+) {
+    let outcome = if error.is_none() { "ok" } else { "fail" };
     #[cfg(test)]
-    ec_degraded_reads_for_test::record(iv.vid, ok);
-    match result {
-        Err(e) => tracing::debug!(
-            "ec degraded read: volume={} generation={} needle={} shard={} available={}/{} result={} error={}",
+    let _mark = ec_degraded_reads_for_test::record(iv.vid, iv.reason, outcome);
+    crate::metrics::EC_DEGRADED_READ_COUNTER
+        .with_label_values(&[iv.reason.as_str(), outcome])
+        .inc();
+    match error {
+        Some(e) => tracing::debug!(
+            "ec degraded read: volume={} generation={} needle={} shard={} available={}/{} reason={} result={} error={}",
             iv.vid.0,
             iv.expected_encode_ts_ns,
             iv.needle_id,
             iv.shard_id,
             available,
             data_shards,
+            iv.reason.as_str(),
             outcome,
             e
         ),
-        Ok(_) => tracing::debug!(
-            "ec degraded read: volume={} generation={} needle={} shard={} available={}/{} result={}",
+        None => tracing::debug!(
+            "ec degraded read: volume={} generation={} needle={} shard={} available={}/{} reason={} result={}",
             iv.vid.0,
             iv.expected_encode_ts_ns,
             iv.needle_id,
             iv.shard_id,
             available,
             data_shards,
+            iv.reason.as_str(),
             outcome
         ),
     }
 }
 
-/// Per-volume marks, so tests running in parallel each see only their own
-/// volume's reconstructions; the counter itself is process-wide.
+/// Every mark with its volume, taken under the lock the counter increment runs
+/// under, so a test can check the real counter against all marks in its window
+/// and its own volume's marks exactly, while other tests run in parallel.
 #[cfg(test)]
 pub(crate) mod ec_degraded_reads_for_test {
+    use super::EcReadReason;
     use crate::storage::types::VolumeId;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, MutexGuard};
 
-    static MARKS: Mutex<Vec<(VolumeId, bool)>> = Mutex::new(Vec::new());
+    pub(crate) type Mark = (VolumeId, EcReadReason, &'static str);
+    /// The counter's value for one (reason, outcome) label.
+    pub(crate) type Count = ((EcReadReason, &'static str), u64);
+    static MARKS: Mutex<Vec<Mark>> = Mutex::new(Vec::new());
 
-    pub(crate) fn record(vid: VolumeId, ok: bool) {
-        MARKS.lock().unwrap().push((vid, ok));
+    /// Records a mark and holds the lock while the caller bumps the counter.
+    pub(crate) fn record(
+        vid: VolumeId,
+        reason: EcReadReason,
+        outcome: &'static str,
+    ) -> MutexGuard<'static, Vec<Mark>> {
+        let mut marks = MARKS.lock().unwrap();
+        marks.push((vid, reason, outcome));
+        marks
     }
 
-    /// (ok, fail) marks for vid so far.
-    pub(crate) fn counts(vid: VolumeId) -> (usize, usize) {
+    /// All marks so far and the counter for every label, read together.
+    pub(crate) fn snapshot() -> (Vec<Mark>, Vec<Count>) {
         let marks = MARKS.lock().unwrap();
-        let ok = marks.iter().filter(|(v, ok)| *v == vid && *ok).count();
-        let fail = marks.iter().filter(|(v, ok)| *v == vid && !*ok).count();
-        (ok, fail)
+        let mut counter = Vec::new();
+        for reason in [
+            EcReadReason::Read,
+            EcReadReason::Scrub,
+            EcReadReason::Delete,
+            EcReadReason::Admin,
+        ] {
+            for outcome in ["ok", "fail"] {
+                let value = crate::metrics::EC_DEGRADED_READ_COUNTER
+                    .with_label_values(&[reason.as_str(), outcome])
+                    .get();
+                counter.push(((reason, outcome), value));
+            }
+        }
+        (marks.clone(), counter)
     }
 }
 
@@ -2015,6 +2100,10 @@ async fn rebuild_ec_needle_from_dropped_inputs(
         if check.read_bytes(&candidate, offset, size, version).is_err() || check.id != needle_id {
             continue;
         }
+        for (i, iv) in metas.iter().enumerate() {
+            let available = gathered_shards(&gathers[i], Some(drop));
+            mark_ec_degraded_read(*iv, data_shards, available, None);
+        }
         // The verdict convicts every differing range — and the dropped input,
         // without which the same decode kept failing to parse.
         let mut pos = 0usize;
@@ -2030,7 +2119,25 @@ async fn rebuild_ec_needle_from_dropped_inputs(
         }
         return (Some(candidate), false);
     }
+    for (i, iv) in metas.iter().enumerate() {
+        let error = "no dropped-input reconstruction parses".to_string();
+        mark_ec_degraded_read(
+            *iv,
+            data_shards,
+            gathered_shards(&gathers[i], None),
+            Some(error),
+        );
+    }
     (None, false)
+}
+
+/// The gathered shard intervals, less `drop`.
+fn gathered_shards(gathered: &[Option<Vec<u8>>], drop: Option<ShardId>) -> usize {
+    gathered
+        .iter()
+        .enumerate()
+        .filter(|(sid, slot)| slot.is_some() && Some(*sid as ShardId) != drop)
+        .count()
 }
 
 // parse_grpc_address lives in `grpc_client.rs` and is re-exported

@@ -1154,10 +1154,11 @@ impl VolumeServer for VolumeGrpcService {
                     }
                 } else {
                     use crate::server::store_ec::EcMiss;
-                    let read = crate::server::store_ec::read_ec_shard_needle_or_miss(
+                    let read = crate::server::store_ec::read_ec_shard_needle_or_miss_for(
                         &self.state,
                         file_id.volume_id,
                         n.id,
+                        crate::server::store_ec::EcReadReason::Delete,
                     )
                     .await;
                     let error = match read {
@@ -5966,8 +5967,13 @@ impl VolumeServer for VolumeGrpcService {
 
         // Intervals on shards held by other nodes are fetched or reconstructed, as in Go.
         use crate::server::store_ec::EcMiss;
-        match crate::server::store_ec::read_ec_shard_needle_or_miss(&self.state, vid, needle_id)
-            .await
+        match crate::server::store_ec::read_ec_shard_needle_or_miss_for(
+            &self.state,
+            vid,
+            needle_id,
+            crate::server::store_ec::EcReadReason::Admin,
+        )
+        .await
         {
             Ok(Ok(n)) => {
                 let ttl_str = match &n.ttl {

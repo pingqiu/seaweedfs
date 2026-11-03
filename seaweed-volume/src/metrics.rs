@@ -59,15 +59,16 @@ pub static HANDLER_COUNTER: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("metric can be created")
 });
 
-/// EC shard intervals reconstructed for a read, by `result` (ok/fail). Go:
+/// EC shard intervals reconstructed from other shards, by `reason`
+/// (read/scrub/delete/admin) and `result` (ok/fail). Go:
 /// VolumeServerECDegradedReadCounter.
 pub static EC_DEGRADED_READ_COUNTER: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
         Opts::new(
             "SeaweedFS_volumeServer_ec_degraded_read_total",
-            "Counter of EC shard intervals reconstructed for a read, by result.",
+            "Counter of EC shard intervals reconstructed from other shards, by reason and result.",
         ),
-        &["result"],
+        &["reason", "result"],
     )
     .expect("metric can be created")
 });
