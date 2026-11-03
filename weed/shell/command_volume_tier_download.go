@@ -45,6 +45,11 @@ func (c *commandVolumeTierDownload) Help() string {
 
 	This command will download the dat file of a volume from a remote tier to a volume server in local cluster.
 
+	The remote object is kept. Another replica may register a new reference to it
+	while this command runs, and that reference cannot be seen from here, so deleting
+	the object could leave the new reference dangling. Remove the object yourself once
+	no volume references it.
+
 `
 }
 
@@ -141,13 +146,13 @@ func doVolumeTierDownload(commandEnv *CommandEnv, writer io.Writer, topoInfo *ma
 		return fmt.Errorf("volume %d not found in collections matching %q", vid, collectionPattern)
 	}
 
-	// All replicas point at the same remote object; only the final download may delete
-	// it. Every earlier replica keeps it so the survivors are not left dangling.
+	// All replicas point at the same remote object, and a replica that registers a
+	// new reference while this runs is not in this location snapshot. No download
+	// deletes the object: a leaked object costs storage, a deleted one loses data.
 	// TODO parallelize this
-	for i, loc := range locations {
-		keepRemote := i < len(locations)-1
+	for _, loc := range locations {
 		// copy the .dat file from remote tier to local
-		err = downloadDatFromRemoteTier(commandEnv.option.GrpcDialOption, writer, needle.VolumeId(vid), collection, loc.ServerAddress(), keepRemote, concurrency)
+		err = downloadDatFromRemoteTier(commandEnv.option.GrpcDialOption, writer, needle.VolumeId(vid), collection, loc.ServerAddress(), true, concurrency)
 		if err != nil {
 			// A replica already made local by a prior interrupted run is not a
 			// failure; skip it so the remaining remote replicas still download.
@@ -158,6 +163,7 @@ func doVolumeTierDownload(commandEnv *CommandEnv, writer io.Writer, topoInfo *ma
 			return fmt.Errorf("download dat file for volume %d to %s: %v", vid, loc.Url, err)
 		}
 	}
+	fmt.Fprintf(writer, "volume %d: remote object kept; remove it once no volume references it\n", vid)
 
 	return nil
 }
