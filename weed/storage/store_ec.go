@@ -1326,13 +1326,12 @@ func noteEcDegradedRead(reason EcReadReason, ecVolume *erasure_coding.EcVolume, 
 	if ecVolume.ECContext != nil {
 		need = ecVolume.ECContext.DataShards
 	}
+	errText := "-"
 	if err != nil {
-		glog.Infof("ec degraded read: volume=%d generation=%d needle=%s shard=%d available=%d/%d reason=%s result=%s error=%v",
-			ecVolume.VolumeId, ecVolume.EncodeTsNs, needleId, shardId, available, need, reason, result, err)
-		return
+		errText = err.Error()
 	}
-	glog.Infof("ec degraded read: volume=%d generation=%d needle=%s shard=%d available=%d/%d reason=%s result=%s",
-		ecVolume.VolumeId, ecVolume.EncodeTsNs, needleId, shardId, available, need, reason, result)
+	glog.Infof("ec degraded read: volume=%d generation=%d needle=%s shard=%d available=%d/%d reason=%s result=%s error=%s",
+		ecVolume.VolumeId, ecVolume.EncodeTsNs, needleId, shardId, available, need, reason, result, errText)
 }
 
 func (s *Store) EcVolumes() (ecVolumes []*erasure_coding.EcVolume) {

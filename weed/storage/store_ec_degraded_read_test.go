@@ -266,7 +266,7 @@ func TestEcDegradedReadLogLine(t *testing.T) {
 	}
 	_, n, markers := read(23)
 	want := "ec degraded read: volume=23 generation=1700000000123456789 needle=" + n.Id.String() +
-		" shard=0 available=10/10 reason=read result=ok"
+		" shard=0 available=10/10 reason=read result=ok error=-"
 	if !strings.HasSuffix(markers, want) || strings.Count(markers, "ec degraded read:") != 1 {
 		t.Errorf("at V(1) the marker is %q, want one line ending %q", markers, want)
 	}

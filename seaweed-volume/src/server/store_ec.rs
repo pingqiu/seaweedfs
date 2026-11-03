@@ -1719,31 +1719,18 @@ fn mark_ec_degraded_read(
     crate::metrics::EC_DEGRADED_READ_COUNTER
         .with_label_values(&[iv.reason.as_str(), outcome])
         .inc();
-    match error {
-        Some(e) => tracing::debug!(
-            "ec degraded read: volume={} generation={} needle={} shard={} available={}/{} reason={} result={} error={}",
-            iv.vid.0,
-            iv.expected_encode_ts_ns,
-            iv.needle_id,
-            iv.shard_id,
-            available,
-            data_shards,
-            iv.reason.as_str(),
-            outcome,
-            e
-        ),
-        None => tracing::debug!(
-            "ec degraded read: volume={} generation={} needle={} shard={} available={}/{} reason={} result={}",
-            iv.vid.0,
-            iv.expected_encode_ts_ns,
-            iv.needle_id,
-            iv.shard_id,
-            available,
-            data_shards,
-            iv.reason.as_str(),
-            outcome
-        ),
-    }
+    tracing::debug!(
+        "ec degraded read: volume={} generation={} needle={} shard={} available={}/{} reason={} result={} error={}",
+        iv.vid.0,
+        iv.expected_encode_ts_ns,
+        iv.needle_id,
+        iv.shard_id,
+        available,
+        data_shards,
+        iv.reason.as_str(),
+        outcome,
+        error.as_deref().unwrap_or("-")
+    );
 }
 
 /// Every mark with its volume, taken under the lock the counter increment runs
