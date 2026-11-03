@@ -28,6 +28,13 @@ type DataNode struct {
 	// no new volumes on it and assigns no writes to the volumes it holds. Read
 	// on the assign and volume-growth paths without the node lock.
 	maintenanceMode atomic.Bool
+	// heartbeatDeadline is when this volume server's heartbeats count as
+	// stopped (monoSeconds; 0 until the first one). A silently partitioned
+	// server keeps its stream, and its volumes writable, until gRPC keepalive
+	// gives up (~80 s); the assign path skips its volumes past this instead.
+	// Kept apart from LastSeen, which VolumeLocationList.Stats reads as "older
+	// than a minute". Read on the assign path without the node lock.
+	heartbeatDeadline atomic.Int64
 	// lookupDigest covers the volumes reachable through this node in the volume
 	// layouts, for comparison against what its disks actually hold.
 	lookupDigest atomic.Uint64
@@ -72,6 +79,25 @@ func (dn *DataNode) InMaintenanceMode() bool {
 // Topology.SetDataNodeMaintenanceMode, which also updates the writable lists.
 func (dn *DataNode) SetMaintenanceMode(on bool) (changed bool) {
 	return dn.maintenanceMode.Swap(on) != on
+}
+
+// MarkHeartbeat records a heartbeat: the server counts as stopped after
+// deadline (monoSeconds), see Topology.HeartbeatDeadline.
+func (dn *DataNode) MarkHeartbeat(deadline int64) {
+	dn.heartbeatDeadline.Store(deadline)
+}
+
+// HeartbeatDeadlineSeconds is the recorded deadline (monoSeconds; 0 until the
+// first heartbeat), for comparison with Topology.HeartbeatDeadline.
+func (dn *DataNode) HeartbeatDeadlineSeconds() int64 {
+	return dn.heartbeatDeadline.Load()
+}
+
+// heartbeatOverdue reports a server whose heartbeats stopped before now. One
+// never heard from on this stream yet is not overdue.
+func (dn *DataNode) heartbeatOverdue(now int64) bool {
+	d := dn.heartbeatDeadline.Load()
+	return d != 0 && now > d
 }
 
 func (dn *DataNode) AddOrUpdateVolume(v storage.VolumeInfo) (isNew, isChangedRO, tierTransition bool) {

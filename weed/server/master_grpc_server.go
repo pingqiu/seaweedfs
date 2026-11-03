@@ -289,6 +289,7 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 			dn.Counter++
 		}
 
+		dn.MarkHeartbeat(ms.Topo.HeartbeatDeadline(time.Now()))
 		dn.AdjustMaxVolumeCounts(heartbeat.MaxVolumeCounts)
 		dn.AdjustDiskUsageBytes(heartbeat.DiskTotalBytes, heartbeat.DiskFreeBytes)
 		dn.UpdateDiskTags(heartbeat.DiskTags)

@@ -501,6 +501,23 @@ func (t *Topology) IsWarmingUp() bool {
 	return time.Since(lastChange) < t.WarmupDuration()
 }
 
+// HeartbeatDeadline is when a volume server heard at now counts as stopped:
+// three missed pulses, the freshThreshHold of CollectDeadNodeAndFullVolumes.
+// Volume servers heartbeat every pulse. In monoSeconds, so a wall-clock step
+// cannot mark every server silent (or none) at once.
+func (t *Topology) HeartbeatDeadline(now time.Time) int64 {
+	return monoSeconds(now) + 3*t.pulse
+}
+
+// monoBase anchors monoSeconds; time.Now carries a monotonic reading.
+var monoBase = time.Now()
+
+// monoSeconds is now in whole seconds since process start on the monotonic
+// clock (time.Time.Sub uses it when both sides carry one).
+func monoSeconds(now time.Time) int64 {
+	return int64(now.Sub(monoBase) / time.Second)
+}
+
 // WarmupDuration returns the configured warmup duration based on pulse interval.
 func (t *Topology) WarmupDuration() time.Duration {
 	return time.Duration(t.pulse*WarmupPulseMultiplier) * time.Second

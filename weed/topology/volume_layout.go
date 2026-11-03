@@ -723,12 +723,21 @@ func (vl *VolumeLayout) PickForWrite(count uint64, option *VolumeGrowOption) (vi
 	if lenWriters <= 0 {
 		return 0, 0, nil, true, fmt.Errorf("%s", NoWritableVolumes)
 	}
+	now := monoSeconds(time.Now())
 	if option.DataCenter == "" && option.Rack == "" && option.DataNode == "" {
 		writables := vl.writables
 		if vl.maxWritableVolumes > 0 && len(writables) > vl.maxWritableVolumes {
 			writables = vl.fullestWritable(writables)
 		}
 		vid, locationList = vl.pickWeightedByRemaining(writables)
+		if locationList != nil && !vl.heartbeatCurrent(vid, now) {
+			// Rare: a holder went silent. Pick again among the volumes whose
+			// holders all still heartbeat, or ask for growth if none is left.
+			if writables = vl.heartbeatCurrentOnly(writables, now); len(writables) == 0 {
+				return 0, 0, nil, true, fmt.Errorf("%s", NoWritableVolumes)
+			}
+			vid, locationList = vl.pickWeightedByRemaining(writables)
+		}
 		if locationList == nil || len(locationList.list) == 0 {
 			return 0, 0, nil, false, fmt.Errorf("Strangely vid %s is on no machine!", vid.String())
 		}
@@ -740,6 +749,9 @@ func (vl *VolumeLayout) PickForWrite(count uint64, option *VolumeGrowOption) (vi
 		// matching writable before narrowing to the fullest.
 		var matches []needle.VolumeId
 		for _, writableVolumeId := range vl.writables {
+			if !vl.heartbeatCurrent(writableVolumeId, now) {
+				continue
+			}
 			volumeLocationList := vl.vid2location[writableVolumeId]
 			for _, dn := range volumeLocationList.list {
 				if dn.matchesLocation(option) {
@@ -765,6 +777,9 @@ func (vl *VolumeLayout) PickForWrite(count uint64, option *VolumeGrowOption) (vi
 	start := rand.IntN(lenWriters)
 	for i := 0; i < lenWriters && found < pickSampleSize; i++ {
 		writableVolumeId := vl.writables[(start+i)%lenWriters]
+		if !vl.heartbeatCurrent(writableVolumeId, now) {
+			continue
+		}
 		volumeLocationList := vl.vid2location[writableVolumeId]
 		for _, dn := range volumeLocationList.list {
 			if !dn.matchesLocation(option) {
@@ -780,6 +795,34 @@ func (vl *VolumeLayout) PickForWrite(count uint64, option *VolumeGrowOption) (vi
 	}
 	vid, locationList = vl.weightedPick(sample[:found])
 	return vid, count, locationList.Copy(), false, nil
+}
+
+// heartbeatCurrent reports whether every holder of vid still heartbeats. A
+// write lands on one replica and is forwarded to the rest, so one silent
+// holder blocks it until the holder's heartbeat stream breaks; the volume is
+// skipped until the holder heartbeats again. Callers hold accessLock.
+func (vl *VolumeLayout) heartbeatCurrent(vid needle.VolumeId, now int64) bool {
+	if location := vl.vid2location[vid]; location != nil {
+		for _, dn := range location.list {
+			if dn.heartbeatOverdue(now) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// heartbeatCurrentOnly is candidates without the volumes that have a silent
+// holder. It returns a new slice and never edits candidates, which may be
+// vl.writables itself.
+func (vl *VolumeLayout) heartbeatCurrentOnly(candidates []needle.VolumeId, now int64) []needle.VolumeId {
+	var kept []needle.VolumeId
+	for _, vid := range candidates {
+		if vl.heartbeatCurrent(vid, now) {
+			kept = append(kept, vid)
+		}
+	}
+	return kept
 }
 
 // pickSampleSize is how many random candidates to sample before doing a

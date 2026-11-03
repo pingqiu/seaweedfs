@@ -318,11 +318,21 @@ func (n *NodeImpl) inMaintenanceMode() bool {
 	return ok && dn.InMaintenanceMode()
 }
 
+// heartbeatSilent is true for a data node whose heartbeats stopped (past the
+// deadline its last heartbeat set; see DataNode.heartbeatOverdue). Racks and
+// data centers never are, with the same rolled-up caveat as maintenance mode.
+func (n *NodeImpl) heartbeatSilent() bool {
+	dn, ok := n.value.(*DataNode)
+	return ok && dn.heartbeatOverdue(monoSeconds(time.Now()))
+}
+
 // AvailableSpaceFor is the free volume slots on this node for the option's disk
 // type. A data node in maintenance mode reports none: it is being drained, so
-// it is neither a volume-growth candidate nor reservable.
+// it is neither a volume-growth candidate nor reservable. Nor is one whose
+// heartbeats stopped: PickForWrite skips its volumes, and growing onto it
+// would hang AllocateVolume on a server that never answers.
 func (n *NodeImpl) AvailableSpaceFor(option *VolumeGrowOption) int64 {
-	if n.inMaintenanceMode() {
+	if n.inMaintenanceMode() || n.heartbeatSilent() {
 		return 0
 	}
 	t := n.diskUsages.getDisk(option.DiskType)
