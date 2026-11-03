@@ -6245,6 +6245,19 @@ mod tests {
         data: &[u8],
         missing: &[crate::storage::erasure_coding::ec_shard::ShardId],
     ) -> NeedleId {
+        put_ec_needle_at(state, tmp, vid, data, missing, 0)
+    }
+
+    /// `put_ec_needle` with the encode generation `encode_ts_ns` stamped in the
+    /// .vif before the shards mount.
+    fn put_ec_needle_at(
+        state: &VolumeServerState,
+        tmp: &tempfile::TempDir,
+        vid: u32,
+        data: &[u8],
+        missing: &[crate::storage::erasure_coding::ec_shard::ShardId],
+        encode_ts_ns: i64,
+    ) -> NeedleId {
         use crate::storage::erasure_coding::ec_encoder::write_ec_files;
         use crate::storage::erasure_coding::ec_shard::ShardId;
         use crate::storage::needle_map::NeedleMapKind;
@@ -6269,7 +6282,21 @@ mod tests {
         v.write_needle(&mut n, true, false).unwrap();
         v.sync_to_disk().unwrap();
         v.close();
-        write_ec_files(dir, dir, "", VolumeId(vid), 10, 4).unwrap();
+        let block_size = write_ec_files(dir, dir, "", VolumeId(vid), 10, 4).unwrap();
+        if encode_ts_ns != 0 {
+            // As the encode RPC records it: the shape, the block layout the
+            // shards were written in, and the generation.
+            let vif = format!("{dir}/{vid}.vif");
+            let mut info: crate::storage::volume::VifVolumeInfo =
+                serde_json::from_str(&std::fs::read_to_string(&vif).unwrap()).unwrap();
+            info.ec_shard_config = Some(crate::storage::volume::VifEcShardConfig {
+                data_shards: 10,
+                parity_shards: 4,
+                encode_ts_ns,
+                block_size,
+            });
+            crate::storage::store::save_vif_volume_info(&vif, &info).unwrap();
+        }
         let mounted: Vec<ShardId> = (0..14).filter(|s| !missing.contains(s)).collect();
         state
             .store
@@ -6390,10 +6417,7 @@ mod tests {
             assert!(read_ec(&state, 63, id, EcReadReason::Read).await.is_none());
         })
         .await;
-        assert!(
-            own.keys().all(|k| *k == ("read", "fail")) && own.get(&("read", "fail")) >= Some(&1),
-            "want only read/fail marks, got {own:?}"
-        );
+        assert_eq!(own, marks(&[(("read", "fail"), 1)]));
     }
 
     /// A delete's read and an admin status read are marked as theirs, not read.
@@ -6514,10 +6538,22 @@ mod tests {
     async fn test_ec_degraded_read_log_line() {
         let _serial = EC_MARKER_TESTS.lock().await;
         use crate::server::store_ec::EcReadReason;
-        async fn logged(level: tracing::Level, vid: u32) -> (NeedleId, String) {
+        const GENERATION: i64 = 1_700_000_000_123_456_789;
+        async fn logged(
+            level: tracing::Level,
+            vid: u32,
+            missing: &[crate::storage::erasure_coding::ec_shard::ShardId],
+        ) -> (NeedleId, String) {
             let tmp = tempfile::TempDir::new().unwrap();
             let state = volume_test_state(&tmp);
-            let id = put_ec_needle(&state, &tmp, vid, b"ec degraded read marker", &[0]);
+            let id = put_ec_needle_at(
+                &state,
+                &tmp,
+                vid,
+                b"ec degraded read marker",
+                missing,
+                GENERATION,
+            );
             let out = Captured::default();
             let subscriber = tracing_subscriber::fmt()
                 .with_max_level(level)
@@ -6528,7 +6564,12 @@ mod tests {
             // Another test may have reached this callsite first with no
             // subscriber and cached it as never enabled.
             tracing::callsite::rebuild_interest_cache();
-            assert!(read_ec(&state, vid, id, EcReadReason::Read).await.is_some());
+            let read = read_ec(&state, vid, id, EcReadReason::Read).await;
+            assert_eq!(
+                read.is_some(),
+                missing.len() == 1,
+                "read with {missing:?} missing"
+            );
             drop(guard);
             let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
             let markers: Vec<&str> = text
@@ -6537,15 +6578,28 @@ mod tests {
                 .collect();
             (id, markers.join("\n"))
         }
-        let (id, markers) = logged(tracing::Level::DEBUG, 66).await;
+        let (id, markers) = logged(tracing::Level::DEBUG, 66, &[0]).await;
         let want = format!(
-            "ec degraded read: volume=66 generation=0 needle={id} shard=0 available=10/10 reason=read result=ok error=-"
+            "ec degraded read: volume=66 generation={GENERATION} needle={id} shard=0 available=10/10 reason=read result=ok error=-"
         );
         assert!(
             markers.ends_with(&want) && markers.matches("ec degraded read:").count() == 1,
             "at debug the marker is {markers:?}, want one line ending {want:?}"
         );
-        let (_, markers) = logged(tracing::Level::INFO, 67).await;
+        let missing = [0, 6, 7, 8, 9, 10, 11, 12, 13];
+        let (id, markers) = logged(tracing::Level::DEBUG, 69, &missing).await;
+        let want = format!(
+            "ec degraded read: volume=69 generation={GENERATION} needle={id} shard=0 available=5/10 reason=read result=fail error="
+        );
+        let lines: Vec<&str> = markers.lines().collect();
+        assert!(
+            lines.len() == 1
+                && lines
+                    .iter()
+                    .all(|l| l.contains(&want) && !l.ends_with("error=-")),
+            "at debug the failure markers are {markers:?}, want 1 line with {want:?} and an error"
+        );
+        let (_, markers) = logged(tracing::Level::INFO, 67, &[0]).await;
         assert!(
             markers.is_empty(),
             "at info the marker was logged: {markers:?}"

@@ -242,15 +242,15 @@ func TestEcDegradedReadLogLine(t *testing.T) {
 		flag.Set("vmodule", "")
 		flag.Set("logtostderr", "false")
 	})
-	read := func(vid needle.VolumeId) (*erasure_coding.EcVolume, *needle.Needle, string) {
+	read := func(vid needle.VolumeId, missing ...erasure_coding.ShardId) (*erasure_coding.EcVolume, *needle.Needle, string) {
 		store := newTestStore(t, 1)
-		ecVolume, n := mountEcShardsExcept(t, store, vid, 0)
+		ecVolume, n := mountEcShardsExcept(t, store, vid, missing...)
 		ecVolume.EncodeTsNs = 1700000000123456789
 		var markers []string
 		logged := captureStderr(t, func() {
 			got := &needle.Needle{Id: n.Id}
-			if _, err := store.ReadEcShardNeedle(vid, got, nil); err != nil {
-				t.Errorf("read needle: %v", err)
+			if _, err := store.ReadEcShardNeedle(vid, got, nil); (err == nil) != (len(missing) == 1) {
+				t.Errorf("read needle with %v missing: %v", missing, err)
 			}
 		})
 		for _, line := range strings.Split(logged, "\n") {
@@ -264,17 +264,30 @@ func TestEcDegradedReadLogLine(t *testing.T) {
 	if err := flag.Set("vmodule", "store_ec=1"); err != nil {
 		t.Fatal(err)
 	}
-	_, n, markers := read(23)
+	_, n, markers := read(23, 0)
 	want := "ec degraded read: volume=23 generation=1700000000123456789 needle=" + n.Id.String() +
 		" shard=0 available=10/10 reason=read result=ok error=-"
 	if !strings.HasSuffix(markers, want) || strings.Count(markers, "ec degraded read:") != 1 {
 		t.Errorf("at V(1) the marker is %q, want one line ending %q", markers, want)
 	}
 
+	_, n, markers = read(25, 0, 6, 7, 8, 9, 10, 11, 12, 13)
+	want = "ec degraded read: volume=25 generation=1700000000123456789 needle=" + n.Id.String() +
+		" shard=0 available=5/10 reason=read result=fail error="
+	lines := strings.Split(markers, "\n")
+	for _, line := range lines {
+		if !strings.Contains(line, want) || strings.HasSuffix(line, "error=-") {
+			t.Errorf("failure marker %q, want it to contain %q and an error", line, want)
+		}
+	}
+	if len(lines) != 1 {
+		t.Errorf("logged %d failure markers, want 1: %q", len(lines), markers)
+	}
+
 	if err := flag.Set("vmodule", ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, markers := read(24); markers != "" {
+	if _, _, markers := read(24, 0); markers != "" {
 		t.Errorf("at the default level the marker was logged: %q", markers)
 	}
 }
