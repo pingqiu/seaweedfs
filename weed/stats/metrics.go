@@ -668,15 +668,16 @@ var (
 			Help:      "Counter of EC shard rebuild operations by result.",
 		}, []string{"result"})
 
-	// VolumeServerECDegradedReadCounter counts reads that had to reconstruct an
-	// EC shard interval from the other shards, by result (ok, fail).
+	// VolumeServerECDegradedReadCounter counts EC shard intervals reconstructed
+	// from the other shards, by why they were read (read, scrub, delete, admin)
+	// and result (ok, fail).
 	VolumeServerECDegradedReadCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: Namespace,
 			Subsystem: subsystemVolumeServer,
 			Name:      "ec_degraded_read_total",
-			Help:      "Counter of EC shard intervals reconstructed for a read, by result.",
-		}, []string{"result"})
+			Help:      "Counter of EC shard intervals reconstructed from other shards, by reason and result.",
+		}, []string{"reason", "result"})
 
 	S3RequestCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{

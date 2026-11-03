@@ -69,7 +69,7 @@ func (vs *VolumeServer) BatchDelete(ctx context.Context, req *volume_server_pb.B
 					continue
 				}
 			} else {
-				if _, err := vs.store.ReadEcShardNeedle(volumeId, n, nil); err != nil {
+				if _, err := vs.store.ReadEcShardNeedleFor(storage.EcReadForDelete, volumeId, n, nil); err != nil {
 					resp.Results = append(resp.Results, &volume_server_pb.DeleteResult{
 						FileId: fid,
 						Status: http.StatusNotFound,

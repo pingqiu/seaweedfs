@@ -170,7 +170,7 @@ func TestRecoverOneRemoteEcShardIntervalUsesLocalShards(t *testing.T) {
 	shardIdToRecover, actualOffset := ecVolume.IntervalToShardIdAndOffset(intervals[0])
 
 	got := make([]byte, intervals[0].Size)
-	nRead, _, err := store.recoverOneRemoteEcShardInterval(n.Id, ecVolume, shardIdToRecover, got, actualOffset)
+	nRead, _, err := store.recoverOneRemoteEcShardInterval(EcReadForClient, n.Id, ecVolume, shardIdToRecover, got, actualOffset)
 	if err != nil {
 		t.Fatalf("recover ec shard interval: %v", err)
 	}
@@ -238,7 +238,7 @@ func TestRecoverOneRemoteEcShardIntervalFetchesOnlyWhatItNeeds(t *testing.T) {
 	const shardIdToRecover = erasure_coding.ShardId(0)
 	const offset = 0
 	got := make([]byte, 4096)
-	if _, _, err := store.recoverOneRemoteEcShardInterval(n.Id, ecVolume, shardIdToRecover, got, offset); err != nil {
+	if _, _, err := store.recoverOneRemoteEcShardInterval(EcReadForClient, n.Id, ecVolume, shardIdToRecover, got, offset); err != nil {
 		t.Fatalf("recover ec shard interval: %v", err)
 	}
 	if requests := peer.requests.Load(); requests != int64(erasure_coding.DataShardsCount) {
@@ -289,7 +289,7 @@ func TestRecoverOneRemoteEcShardIntervalBoundsInFlightBytes(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			store.recoverOneRemoteEcShardInterval(types.Uint64ToNeedleId(42), ecVolume, 0, make([]byte, intervalSize), 0)
+			store.recoverOneRemoteEcShardInterval(EcReadForClient, types.Uint64ToNeedleId(42), ecVolume, 0, make([]byte, intervalSize), 0)
 		}()
 	}
 
