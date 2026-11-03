@@ -716,13 +716,12 @@ fn override_query_fields(query: &str, overrides: &[(&str, String)]) -> Result<St
     Ok(fields.join("&"))
 }
 
-/// Bound on one replica forward attempt, from connecting until its response is
-/// read, or until its headers where only the status is used. Without it a
-/// silently partitioned peer (packets dropped, no reset) holds the write until
-/// TCP gives up, minutes later; the writer instead gets "replication failed"
-/// (500). 10 s stays well under a client's 30 s request budget. It doesn't bound
-/// the whole write: the master lookup before the forwards has only the client's
-/// connect bound.
+/// Bound on one replica forward, from connecting until its response arrives.
+/// Without it a silently partitioned peer (packets dropped, no reset) holds the
+/// write until TCP gives up, minutes later; with it the forward fails and the
+/// writer gets "replication failed" (500). It bounds each forward after the
+/// master lookup, not the whole write: the lookup has only the client's connect
+/// bound.
 pub(crate) const REPLICA_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn replica_request(
@@ -4975,30 +4974,40 @@ fn parse_content_disposition_filename(value: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    async fn spawn_silent_replica() -> std::net::SocketAddr {
+    /// A replica that reads the forward and never answers. Each request's
+    /// first line is sent on the returned channel.
+    async fn spawn_silent_replica() -> (
+        std::net::SocketAddr,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
         use tokio::io::AsyncReadExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let (received, receipts) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
+                let received = received.clone();
                 tokio::spawn(async move {
-                    let mut request = [0u8; 4096];
-                    let _ = socket.read(&mut request).await;
+                    let mut request = vec![0u8; 4096];
+                    let n = socket.read(&mut request).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&request[..n]).into_owned();
+                    let _ = received.send(text.lines().next().unwrap_or("").to_string());
                     std::future::pending::<()>().await;
                 });
             }
         });
-        addr
+        (addr, receipts)
     }
 
-    /// The whole replicated write path, not only the request builder: a peer
-    /// that never answers fails the write at the bound.
+    /// The whole replicated write path, not only the request builder: the
+    /// replica receives the forward, never answers, and the write fails at
+    /// the bound with an error naming that replica.
     #[tokio::test]
     async fn test_replicated_write_fails_at_the_bound_when_a_peer_never_answers() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let master = spawn_lookup(spawn_silent_replica().await).await;
-        let state = remote_manifest_state(&tmp, master);
+        let (peer, mut receipts) = spawn_silent_replica().await;
+        let state = remote_manifest_state(&tmp, spawn_lookup(peer).await);
         let started = std::time::Instant::now();
         let sent = do_replicated_request(
             &state,
@@ -5011,8 +5020,20 @@ mod tests {
         )
         .await;
         let took = started.elapsed();
-        assert!(sent.is_err(), "a silent replica cannot ack the write");
-        assert!(took >= REPLICA_REQUEST_TIMEOUT && took < REPLICA_REQUEST_TIMEOUT * 2, "{took:?}");
+        let forwarded = receipts
+            .try_recv()
+            .expect("the replica never received the forward");
+        assert!(
+            forwarded.starts_with("POST /1,01ab?") && forwarded.contains("type=replicate"),
+            "{forwarded}"
+        );
+        let error = sent.expect_err("a silent replica cannot ack the write");
+        assert!(error.contains(&peer.to_string()), "{error}");
+        assert!(
+            took >= REPLICA_REQUEST_TIMEOUT
+                && took < REPLICA_REQUEST_TIMEOUT + std::time::Duration::from_secs(5),
+            "{took:?}"
+        );
     }
 
     /// A peer that accepts the connection but never answers (a silent
@@ -5045,7 +5066,6 @@ mod tests {
                 && started.elapsed() < REPLICA_REQUEST_TIMEOUT * 2
         );
     }
-
 
     /// The upload handler reads fsync off the decoded query fields rather than
     /// matching the raw string, because Go's r.FormValue decodes and a raw
