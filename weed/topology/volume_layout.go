@@ -733,7 +733,7 @@ func (vl *VolumeLayout) PickForWrite(count uint64, option *VolumeGrowOption) (vi
 		if locationList != nil && !vl.heartbeatCurrent(vid, now) {
 			// Rare: a holder went silent. Pick again among the volumes whose
 			// holders all still heartbeat, or ask for growth if none is left.
-			if writables = vl.heartbeatCurrentOnly(writables, now); len(writables) == 0 {
+			if writables = vl.currentWritable(vl.writables, now); len(writables) == 0 {
 				return 0, 0, nil, true, fmt.Errorf("%s", NoWritableVolumes)
 			}
 			vid, locationList = vl.pickWeightedByRemaining(writables)
@@ -823,6 +823,17 @@ func (vl *VolumeLayout) heartbeatCurrentOnly(candidates []needle.VolumeId, now i
 		}
 	}
 	return kept
+}
+
+// currentWritable is pool without the volumes that have a silent holder,
+// then narrowed to the fullest maxWritableVolumes as PickForWrite narrows it.
+// Filtering first keeps a silent volume from taking a place in that cap.
+func (vl *VolumeLayout) currentWritable(pool []needle.VolumeId, now int64) []needle.VolumeId {
+	current := vl.heartbeatCurrentOnly(pool, now)
+	if vl.maxWritableVolumes > 0 && len(current) > vl.maxWritableVolumes {
+		current = vl.fullestWritable(current)
+	}
+	return current
 }
 
 // pickSampleSize is how many random candidates to sample before doing a

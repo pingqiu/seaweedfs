@@ -83,6 +83,22 @@ func TestPickForWriteSkipsVolumesOnASilentServer(t *testing.T) {
 	}
 }
 
+// With maxWritableVolumes capping the pick to the fullest volumes, a silent
+// volume must not take a place in that cap. Here volume 1, on silent b, is the
+// fullest by tie order, and the healthy volume 3 must be picked rather than
+// growth requested. count 2 keeps the pick on the weighted path.
+func TestPickForWriteCapLeavesOutSilentVolumesFirst(t *testing.T) {
+	_, vl, nodes := heartbeatLayout(t)
+	nodes["b"].MarkHeartbeat(-1) // any non-zero deadline in the past
+	vl.maxWritableVolumes = 1
+	for i := 0; i < 50; i++ {
+		vid, _, _, shouldGrow, err := vl.PickForWrite(2, &VolumeGrowOption{})
+		if err != nil || shouldGrow || vid != 3 {
+			t.Fatalf("pick %d: vid=%d shouldGrow=%v err=%v, want volume 3", i, vid, shouldGrow, err)
+		}
+	}
+}
+
 func TestPickForWriteWithEveryHolderSilentAsksForGrowth(t *testing.T) {
 	_, vl, nodes := heartbeatLayout(t)
 	for _, dn := range nodes {
