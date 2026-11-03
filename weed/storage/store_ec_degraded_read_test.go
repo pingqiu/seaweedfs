@@ -276,8 +276,9 @@ func TestEcDegradedReadLogLine(t *testing.T) {
 		" shard=0 available=5/10 reason=read result=fail error="
 	lines := strings.Split(markers, "\n")
 	for _, line := range lines {
-		if !strings.Contains(line, want) || strings.HasSuffix(line, "error=-") {
-			t.Errorf("failure marker %q, want it to contain %q and an error", line, want)
+		_, failure, _ := strings.Cut(line, " error=")
+		if failure = strings.TrimSpace(failure); !strings.Contains(line, want) || failure == "" || failure == "-" {
+			t.Errorf("failure marker %q, want it to contain %q and a non-empty error", line, want)
 		}
 	}
 	if len(lines) != 1 {

@@ -6594,9 +6594,10 @@ mod tests {
         let lines: Vec<&str> = markers.lines().collect();
         assert!(
             lines.len() == 1
-                && lines
-                    .iter()
-                    .all(|l| l.contains(&want) && !l.ends_with("error=-")),
+                && lines.iter().all(|l| {
+                    let error = l.split_once(" error=").map_or("", |(_, e)| e.trim());
+                    l.contains(&want) && !error.is_empty() && error != "-"
+                }),
             "at debug the failure markers are {markers:?}, want 1 line with {want:?} and an error"
         );
         let (_, markers) = logged(tracing::Level::INFO, 67, &[0]).await;
