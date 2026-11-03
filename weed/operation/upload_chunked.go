@@ -206,17 +206,23 @@ uploadLoop:
 			// A target that fills up, loses its replica peer, or goes away fails
 			// every attempt against the same fid, so ask for a fresh assignment and
 			// retry there rather than losing the whole object to one bad volume.
+			fanoutDeadlines := 0
 			for attempt := 1; ; attempt++ {
 				uploadResult, uploadResultErr = uploadChunk(ctx, assignResult, buf.Bytes(), jwt, chunkMd5B64, opt)
 				if uploadResultErr == nil {
 					break
+				}
+				if errors.Is(uploadResultErr, errReplicaFanoutDeadline) {
+					fanoutDeadlines++
 				}
 				// The volume server commits the needle before replicating, so a
 				// failed write can still leave a copy behind. No chunk will name
 				// this fid whether we retry or give up here, and an unreferenced
 				// needle is not garbage vacuum can find, so drop it either way.
 				deleteChunkFromHolders(chunkHolders(assignResult), assignResult.Fid, jwt, opt)
-				if attempt == chunkAssignAttempts || !ShouldReassignUpload(uploadResultErr) || objectFailed() {
+				// A second fan-out deadline ends the chunk: three would take
+				// 3 x (fan-out + cleanup), about 39 s for one chunk.
+				if attempt == chunkAssignAttempts || !ShouldReassignUpload(uploadResultErr) || objectFailed() || fanoutDeadlines >= 2 {
 					break
 				}
 				glog.V(2).Infof("re-assigning chunk at offset %d after attempt %d/%d: %v", offset, attempt, chunkAssignAttempts, uploadResultErr)
@@ -302,6 +308,18 @@ uploadLoop:
 // before the upload gives up.
 const chunkAssignAttempts = 3
 
+// replicaFanoutTimeout bounds one fan-out of a chunk to its holders, and
+// replicaCleanupTimeout each rollback delete. A chunk stops after its second
+// fan-out deadline, so two failed offers with their cleanups (10+3+10+3 s)
+// take at most about 26 s. Overridable in tests.
+var (
+	replicaFanoutTimeout  = 10 * time.Second
+	replicaCleanupTimeout = 3 * time.Second
+)
+
+// errReplicaFanoutDeadline marks a chunk whose fan-out hit our own deadline.
+var errReplicaFanoutDeadline = errors.New("replica fan-out deadline")
+
 // uploadChunk writes one chunk to its assigned volume. It fans out to every
 // holder, except for cipher: per-call encryption would give each replica
 // different bytes, so keep its relay path.
@@ -362,7 +380,11 @@ func uploadChunkToHolders(ctx context.Context, hosts []string, fid string, data 
 		return nil, fmt.Errorf("create uploader: %w", err)
 	}
 	glog.V(4).Infof("replica fan-out: writing chunk %s to %d holders %v", fid, len(hosts), hosts)
-	ctx, cancel := context.WithCancel(ctx)
+	// One deadline for the whole fan-out, retries included: a silently
+	// partitioned holder otherwise holds the chunk ~50 s across attempts.
+	// Past it the chunk fails reassignable and goes elsewhere.
+	parent := ctx
+	ctx, cancel := context.WithTimeout(ctx, replicaFanoutTimeout)
 	defer cancel()
 	type outcome struct {
 		host   string
@@ -386,6 +408,11 @@ func uploadChunkToHolders(ctx context.Context, hosts []string, fid string, data 
 				Md5:               md5b64,
 			}
 			r, e := uploader.UploadData(ctx, data, uploadOption)
+			if e != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) && parent.Err() == nil {
+				// Our own deadline, not the caller's: a holder that never
+				// answered, which another volume can take (status 0).
+				e = &uploadStatusError{err: fmt.Errorf("replica fan-out to %s exceeded %v: %w: %w", host, replicaFanoutTimeout, errReplicaFanoutDeadline, e)}
+			}
 			outcomes <- outcome{host, r, e}
 		}(host)
 	}
@@ -430,6 +457,13 @@ const cleanupJwtLookupTimeout = 10 * time.Second
 // on, using type=replicate so the volume drops only its local copy. A failed
 // delete falls back to vacuum reclaiming the orphan.
 func deleteChunkFromHolders(hosts []string, fid string, jwt security.EncodedJwt, opt *ChunkedUploadOption) {
+	// A silent holder is usually why the chunk failed; bound each delete so
+	// the cleanup cannot hold the upload in its place.
+	deleteProxied := func(url, jwt string) ([]byte, int, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), replicaCleanupTimeout)
+		defer cancel()
+		return util_http.DeleteProxiedContext(ctx, url, jwt)
+	}
 	// An unresponsive holder can stall the upload past the write JWT's expiry,
 	// so renew the token whenever a holder rejects the delete as unauthorized.
 	// Each holder's delete is retried at most once, and a slow holder that
@@ -437,14 +471,14 @@ func deleteChunkFromHolders(hosts []string, fid string, jwt security.EncodedJwt,
 	deleteJwt := jwt
 	for _, host := range hosts {
 		deleteUrl := fmt.Sprintf("http://%s/%s?type=replicate", host, fid)
-		body, status, err := util_http.DeleteProxied(deleteUrl, string(deleteJwt))
+		body, status, err := deleteProxied(deleteUrl, string(deleteJwt))
 		if status == http.StatusUnauthorized && opt.LookupJwtFunc != nil {
 			lookupCtx, cancel := context.WithTimeout(context.Background(), cleanupJwtLookupTimeout)
 			token := opt.LookupJwtFunc(lookupCtx, fid)
 			cancel()
 			if token != "" {
 				deleteJwt = token
-				body, status, err = util_http.DeleteProxied(deleteUrl, string(deleteJwt))
+				body, status, err = deleteProxied(deleteUrl, string(deleteJwt))
 			}
 		}
 		if err != nil {

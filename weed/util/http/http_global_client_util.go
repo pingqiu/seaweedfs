@@ -192,8 +192,15 @@ func Delete(url string, jwt string) error {
 	return errors.New(string(body))
 }
 
+// DeleteProxied is DeleteProxiedContext with no deadline.
 func DeleteProxied(url string, jwt string) (body []byte, httpStatus int, err error) {
-	req, err := http.NewRequest(http.MethodDelete, url, nil)
+	return DeleteProxiedContext(context.Background(), url, jwt)
+}
+
+// DeleteProxiedContext is DeleteProxied bounded by ctx, so a server that
+// never answers cannot hold the caller.
+func DeleteProxiedContext(ctx context.Context, url string, jwt string) (body []byte, httpStatus int, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
 	if err != nil {
 		return
 	}
