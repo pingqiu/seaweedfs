@@ -122,7 +122,7 @@ func TestDeleteChunkFromHoldersBoundsASilentHolder(t *testing.T) {
 
 // With a silent holder on every offer (the master keeps assigning such
 // volumes until it drops the server), the chunk stops at its second fan-out
-// deadline: two offers, 2 x (10 s + 3 s), about 26 s, not three (~39 s).
+// deadline: two offers, not three.
 func TestUploadReaderInChunksStopsAfterTwoFanoutDeadlines(t *testing.T) {
 	const fanout, cleanup = 300 * time.Millisecond, 200 * time.Millisecond
 	shortFanoutBounds(t, fanout, cleanup)
@@ -171,5 +171,35 @@ func TestUploadChunkToHoldersLeavesTheCallersDeadlineAlone(t *testing.T) {
 	})
 	if err == nil || ShouldReassignUpload(err) || errors.Is(err, errReplicaFanoutDeadline) {
 		t.Fatalf("err = %v, want the caller's deadline, not reassignable", err)
+	}
+}
+
+// A holder that hit the fan-out deadline still counts when another holder's
+// error is the one reported, in either order, and the reported error alone
+// still decides whether the chunk is reassigned.
+func TestFanoutFailureKeepsADeadlineBehindAnotherError(t *testing.T) {
+	deadline := &uploadStatusError{err: fmt.Errorf("replica fan-out to a exceeded: %w", errReplicaFanoutDeadline)}
+	refused := &uploadStatusError{StatusCode: http.StatusConflict, refusedBeforeAppend: true, err: errors.New("refused")}
+	for name, errs := range map[string][]error{
+		"refusal first":  {refused, deadline},
+		"deadline first": {deadline, refused},
+	} {
+		var f fanoutFailure
+		for _, e := range errs {
+			f.add(e)
+		}
+		got := f.err()
+		if !errors.Is(got, errReplicaFanoutDeadline) {
+			t.Errorf("%s: %v does not count as a fan-out deadline", name, got)
+		}
+		var reported *uploadStatusError
+		if !errors.As(got, &reported) || ShouldReassignUpload(got) != ShouldReassignUpload(reported) {
+			t.Errorf("%s: %v changed how the reported error is classified", name, got)
+		}
+	}
+	var alone fanoutFailure
+	alone.add(refused)
+	if got := alone.err(); errors.Is(got, errReplicaFanoutDeadline) || got != error(refused) {
+		t.Errorf("a refusal alone reported %v", got)
 	}
 }

@@ -220,8 +220,8 @@ uploadLoop:
 				// this fid whether we retry or give up here, and an unreferenced
 				// needle is not garbage vacuum can find, so drop it either way.
 				deleteChunkFromHolders(chunkHolders(assignResult), assignResult.Fid, jwt, opt)
-				// A second fan-out deadline ends the chunk: three would take
-				// 3 x (fan-out + cleanup), about 39 s for one chunk.
+				// A second fan-out deadline ends the chunk rather than a third
+				// fan-out and its cleanup.
 				if attempt == chunkAssignAttempts || !ShouldReassignUpload(uploadResultErr) || objectFailed() || fanoutDeadlines >= 2 {
 					break
 				}
@@ -310,8 +310,10 @@ const chunkAssignAttempts = 3
 
 // replicaFanoutTimeout bounds one fan-out of a chunk to its holders, and
 // replicaCleanupTimeout each rollback delete. A chunk stops after its second
-// fan-out deadline, so two failed offers with their cleanups (10+3+10+3 s)
-// take at most about 26 s. Overridable in tests.
+// fan-out deadline. This isn't a bound on the whole chunk: rollback deletes run
+// one after another, for the copies that landed and again for the chunk's
+// holders, and a delete may first renew its token (cleanupJwtLookupTimeout).
+// Overridable in tests.
 var (
 	replicaFanoutTimeout  = 10 * time.Second
 	replicaCleanupTimeout = 3 * time.Second
@@ -417,20 +419,13 @@ func uploadChunkToHolders(ctx context.Context, hosts []string, fid string, data 
 		}(host)
 	}
 	var first *UploadResult
-	var firstErr error
+	var failed fanoutFailure
 	var succeeded []string
 	for range hosts {
 		o := <-outcomes
 		if o.err != nil {
-			// Once one holder fails the rest are cancelled, so errors arrive in
-			// no fixed order. Prefer one the caller can act on, or the choice of
-			// which host to report — and whether to retry elsewhere — turns on
-			// goroutine scheduling.
-			if firstErr == nil {
-				firstErr = o.err
+			if failed.add(o.err) {
 				cancel()
-			} else if !ShouldReassignUpload(firstErr) && ShouldReassignUpload(o.err) {
-				firstErr = o.err
 			}
 		} else {
 			succeeded = append(succeeded, o.host)
@@ -439,14 +434,62 @@ func uploadChunkToHolders(ctx context.Context, hosts []string, fid string, data 
 			}
 		}
 	}
-	if firstErr != nil {
+	if err := failed.err(); err != nil {
 		// A failed fan-out records no chunk, so roll back the copies that landed
 		// before the cancel rather than leaking them as orphans.
 		deleteChunkFromHolders(succeeded, fid, jwt, opt)
-		return nil, firstErr
+		return nil, err
 	}
 	return first, nil
 }
+
+// fanoutFailure collects the errors of one fan-out. Once one holder fails the
+// rest are cancelled, so errors arrive in no fixed order. It prefers one the
+// caller can act on, or the choice of which host to report, and whether to
+// retry elsewhere, would turn on goroutine scheduling. Whether any holder hit
+// the fan-out deadline is kept apart from that choice, so the deadline still
+// counts when another holder's error is the one reported.
+type fanoutFailure struct {
+	first    error
+	deadline bool
+}
+
+// add records err and reports whether it is the fan-out's first failure.
+func (f *fanoutFailure) add(err error) bool {
+	if errors.Is(err, errReplicaFanoutDeadline) {
+		f.deadline = true
+	}
+	if f.first == nil {
+		f.first = err
+		return true
+	}
+	if !ShouldReassignUpload(f.first) && ShouldReassignUpload(err) {
+		f.first = err
+	}
+	return false
+}
+
+// err is the error to report: the chosen one, marked as a fan-out deadline
+// when any holder hit it. The chosen error alone still decides reassignment.
+func (f *fanoutFailure) err() error {
+	if f.first == nil || !f.deadline || errors.Is(f.first, errReplicaFanoutDeadline) {
+		return f.first
+	}
+	return &alsoFanoutDeadline{f.first}
+}
+
+// alsoFanoutDeadline is a fan-out error reported for one holder while another
+// holder hit the fan-out deadline. It unwraps only to that error, so how the
+// error is classified doesn't change.
+type alsoFanoutDeadline struct{ err error }
+
+func (e *alsoFanoutDeadline) Error() string {
+	return e.err.Error() + " (another holder reached the replica fan-out deadline)"
+}
+
+func (e *alsoFanoutDeadline) Unwrap() error { return e.err }
+
+func (e *alsoFanoutDeadline) Is(target error) bool { return target == errReplicaFanoutDeadline }
 
 // cleanupJwtLookupTimeout bounds a cleanup-token renewal, covering the wait
 // for a master plus the lookup RPC, so a master outage cannot stall the
