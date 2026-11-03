@@ -1629,12 +1629,90 @@ async fn gather_ec_shard_intervals(
 /// Rebuild `iv.shard_id`'s interval from the shards outside `exclude`, which
 /// always contains `iv.shard_id` itself. Go's `recoverEcShardInterval`: the
 /// needle-level rebuild passes the whole suspect set so a bad copy cannot
-/// poison the reconstruction it is being compared against.
+/// poison the reconstruction it is being compared against. Every call is
+/// marked by `note_ec_degraded_read`.
 async fn recover_one_remote_ec_shard_interval(
     state: &Arc<VolumeServerState>,
     iv: EcInterval,
     map: EcShardMap<'_>,
     exclude: &HashSet<ShardId>,
+) -> io::Result<(Vec<u8>, bool)> {
+    let mut available = 0;
+    let result = reconstruct_ec_shard_interval(state, iv, map, exclude, &mut available).await;
+    note_ec_degraded_read(iv, map.data_shards, available, &result);
+    result
+}
+
+/// Marks one reconstructed read: a counter by result, and a debug line binding
+/// it to the volume, the encode generation and the needle, which the counter
+/// can't carry. It's `ok` only when the interval was rebuilt; a holder's
+/// deleted report with too few shards counts as `fail`, as in Go.
+fn note_ec_degraded_read(
+    iv: EcInterval,
+    data_shards: usize,
+    available: usize,
+    result: &io::Result<(Vec<u8>, bool)>,
+) {
+    let ok = result.is_ok() && available >= data_shards;
+    let outcome = if ok { "ok" } else { "fail" };
+    crate::metrics::EC_DEGRADED_READ_COUNTER
+        .with_label_values(&[outcome])
+        .inc();
+    #[cfg(test)]
+    ec_degraded_reads_for_test::record(iv.vid, ok);
+    match result {
+        Err(e) => tracing::debug!(
+            "ec degraded read: volume={} generation={} needle={} shard={} available={}/{} result={} error={}",
+            iv.vid.0,
+            iv.expected_encode_ts_ns,
+            iv.needle_id,
+            iv.shard_id,
+            available,
+            data_shards,
+            outcome,
+            e
+        ),
+        Ok(_) => tracing::debug!(
+            "ec degraded read: volume={} generation={} needle={} shard={} available={}/{} result={}",
+            iv.vid.0,
+            iv.expected_encode_ts_ns,
+            iv.needle_id,
+            iv.shard_id,
+            available,
+            data_shards,
+            outcome
+        ),
+    }
+}
+
+/// Per-volume marks, so tests running in parallel each see only their own
+/// volume's reconstructions; the counter itself is process-wide.
+#[cfg(test)]
+pub(crate) mod ec_degraded_reads_for_test {
+    use crate::storage::types::VolumeId;
+    use std::sync::Mutex;
+
+    static MARKS: Mutex<Vec<(VolumeId, bool)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn record(vid: VolumeId, ok: bool) {
+        MARKS.lock().unwrap().push((vid, ok));
+    }
+
+    /// (ok, fail) marks for vid so far.
+    pub(crate) fn counts(vid: VolumeId) -> (usize, usize) {
+        let marks = MARKS.lock().unwrap();
+        let ok = marks.iter().filter(|(v, ok)| *v == vid && *ok).count();
+        let fail = marks.iter().filter(|(v, ok)| *v == vid && !*ok).count();
+        (ok, fail)
+    }
+}
+
+async fn reconstruct_ec_shard_interval(
+    state: &Arc<VolumeServerState>,
+    iv: EcInterval,
+    map: EcShardMap<'_>,
+    exclude: &HashSet<ShardId>,
+    available_out: &mut usize,
 ) -> io::Result<(Vec<u8>, bool)> {
     let EcInterval {
         vid,
@@ -1667,6 +1745,7 @@ async fn recover_one_remote_ec_shard_interval(
     let (mut bufs, any_deleted) =
         gather_ec_shard_intervals(state, iv, map, exclude, data_shards).await;
     let available = bufs.iter().filter(|b| b.is_some()).count();
+    *available_out = available;
 
     if available < data_shards {
         // A holder reporting the needle deleted is authoritative -- deletes are

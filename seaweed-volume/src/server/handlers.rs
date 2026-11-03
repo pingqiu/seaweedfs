@@ -6230,6 +6230,127 @@ mod tests {
         })
     }
 
+    /// Writes one needle to a fresh volume `vid`, EC-encodes it 10+4, and mounts
+    /// every shard but those in `missing`. The needle is small, so it lies on
+    /// shard 0.
+    fn put_ec_needle(
+        state: &VolumeServerState,
+        tmp: &tempfile::TempDir,
+        vid: u32,
+        data: &[u8],
+        missing: &[crate::storage::erasure_coding::ec_shard::ShardId],
+    ) -> NeedleId {
+        use crate::storage::erasure_coding::ec_encoder::write_ec_files;
+        use crate::storage::erasure_coding::ec_shard::ShardId;
+        use crate::storage::needle_map::NeedleMapKind;
+        use crate::storage::volume::{Volume, VolumeSpec};
+
+        let dir = tmp.path().to_str().unwrap();
+        let v = Volume::new(
+            dir,
+            dir,
+            VolumeId(vid),
+            NeedleMapKind::InMemory,
+            &VolumeSpec::default(),
+        )
+        .unwrap();
+        let mut n = Needle {
+            id: NeedleId(7),
+            cookie: Cookie(TEST_COOKIE),
+            data: data.to_vec(),
+            data_size: data.len() as u32,
+            ..Needle::default()
+        };
+        v.write_needle(&mut n, true, false).unwrap();
+        v.sync_to_disk().unwrap();
+        v.close();
+        write_ec_files(dir, dir, "", VolumeId(vid), 10, 4).unwrap();
+        let mounted: Vec<ShardId> = (0..14).filter(|s| !missing.contains(s)).collect();
+        state
+            .store
+            .write()
+            .unwrap()
+            .mount_ec_shards(VolumeId(vid), "", &mounted)
+            .unwrap();
+        NeedleId(7)
+    }
+
+    /// The marks, and the process-wide counter, for one EC read of `vid`.
+    async fn ec_read_marks(
+        state: &Arc<VolumeServerState>,
+        vid: u32,
+        needle_id: NeedleId,
+    ) -> (Option<Vec<u8>>, (usize, usize), (u64, u64)) {
+        use crate::server::store_ec::ec_degraded_reads_for_test::counts;
+        let counter = |r: &str| {
+            crate::metrics::EC_DEGRADED_READ_COUNTER
+                .with_label_values(&[r])
+                .get()
+        };
+        let (ok0, fail0) = counts(VolumeId(vid));
+        let (cok0, cfail0) = (counter("ok"), counter("fail"));
+        let read = crate::server::store_ec::read_ec_shard_needle_distributed(
+            state,
+            VolumeId(vid),
+            needle_id,
+        )
+        .await
+        .ok()
+        .flatten()
+        .map(|n| n.data);
+        let (ok1, fail1) = counts(VolumeId(vid));
+        (
+            read,
+            (ok1 - ok0, fail1 - fail0),
+            (counter("ok") - cok0, counter("fail") - cfail0),
+        )
+    }
+
+    /// A read whose shards are all mounted reads them directly and isn't marked.
+    #[tokio::test]
+    async fn test_ec_degraded_read_not_marked_for_a_direct_read() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = volume_test_state(&tmp);
+        let id = put_ec_needle(&state, &tmp, 61, b"ec degraded read marker", &[]);
+        let (read, marks, _) = ec_read_marks(&state, 61, id).await;
+        assert_eq!(read.as_deref(), Some(&b"ec degraded read marker"[..]));
+        assert_eq!(marks, (0, 0), "a direct read was marked as degraded");
+    }
+
+    /// With the needle's shard missing the read reconstructs it: marked ok once,
+    /// the counter moves, and the bytes are exact.
+    #[tokio::test]
+    async fn test_ec_degraded_read_marks_a_reconstructed_read() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = volume_test_state(&tmp);
+        let id = put_ec_needle(&state, &tmp, 62, b"ec degraded read marker", &[0]);
+        let (read, marks, counter) = ec_read_marks(&state, 62, id).await;
+        assert_eq!(read.as_deref(), Some(&b"ec degraded read marker"[..]));
+        assert_eq!(marks, (1, 0), "one reconstructed interval, rebuilt");
+        assert!(counter.0 >= 1, "the ok counter did not move: {counter:?}");
+    }
+
+    /// With fewer than ten shards the reconstruction fails and is marked fail.
+    #[tokio::test]
+    async fn test_ec_degraded_read_marks_a_failed_reconstruction() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = volume_test_state(&tmp);
+        let id = put_ec_needle(
+            &state,
+            &tmp,
+            63,
+            b"ec degraded read marker",
+            &[0, 6, 7, 8, 9, 10, 11, 12, 13],
+        );
+        let (read, marks, counter) = ec_read_marks(&state, 63, id).await;
+        assert!(read.is_none(), "read with 5 shards returned bytes");
+        assert!(
+            marks.0 == 0 && marks.1 >= 1,
+            "want only fail marks, got {marks:?}"
+        );
+        assert!(counter.1 >= 1, "the fail counter did not move: {counter:?}");
+    }
+
     /// Write `data` as a chunk manifest on a fresh EC volume 2. Chunks stay on volume 1.
     fn put_ec_manifest(
         state: &VolumeServerState,

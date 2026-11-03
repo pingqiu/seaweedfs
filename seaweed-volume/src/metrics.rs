@@ -59,6 +59,19 @@ pub static HANDLER_COUNTER: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("metric can be created")
 });
 
+/// EC shard intervals reconstructed for a read, by `result` (ok/fail). Go:
+/// VolumeServerECDegradedReadCounter.
+pub static EC_DEGRADED_READ_COUNTER: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "SeaweedFS_volumeServer_ec_degraded_read_total",
+            "Counter of EC shard intervals reconstructed for a read, by result.",
+        ),
+        &["result"],
+    )
+    .expect("metric can be created")
+});
+
 // ---- Vacuuming metrics (Go: VolumeServerVacuuming*) ----
 
 /// Vacuuming compact counter with label `success` (true/false).
@@ -384,6 +397,7 @@ pub fn register_metrics() {
             Box::new(REQUEST_COUNTER.clone()),
             Box::new(REQUEST_DURATION.clone()),
             Box::new(HANDLER_COUNTER.clone()),
+            Box::new(EC_DEGRADED_READ_COUNTER.clone()),
             Box::new(VACUUMING_COMPACT_COUNTER.clone()),
             Box::new(VACUUMING_COMMIT_COUNTER.clone()),
             Box::new(VACUUMING_HISTOGRAM.clone()),

@@ -1223,6 +1223,8 @@ func (s *Store) recoverOneRemoteEcShardInterval(needleId types.NeedleId, ecVolum
 // outside exclude, which always contains shardIdToRecover itself.
 func (s *Store) recoverEcShardInterval(needleId types.NeedleId, ecVolume *erasure_coding.EcVolume, shardIdToRecover erasure_coding.ShardId, buf []byte, offset int64, exclude map[erasure_coding.ShardId]bool) (n int, is_deleted bool, err error) {
 	glog.V(3).Infof("recover ec shard %d.%d from other locations", ecVolume.VolumeId, shardIdToRecover)
+	available := 0
+	defer func() { noteEcDegradedRead(ecVolume, needleId, shardIdToRecover, available, err) }()
 
 	// Reconstruct with the volume's OWN EC ratio (loaded from its .vif), not the
 	// build default, so a custom-ratio volume (e.g. 9+3) is decoded with the matrix
@@ -1254,6 +1256,11 @@ func (s *Store) recoverEcShardInterval(needleId types.NeedleId, ecVolume *erasur
 	defer ecRecoverSem.Release(weight)
 
 	shardIntervals, is_deleted := s.gatherEcShardIntervals(needleId, ecVolume, ecCtx, exclude, len(buf), offset, ecCtx.DataShards)
+	for _, shardInterval := range shardIntervals {
+		if shardInterval != nil {
+			available++
+		}
+	}
 	if err := reconstructEcShardInterval(ecVolume, ecCtx, shardIntervals, shardIdToRecover); err != nil {
 		return 0, is_deleted, err
 	}
@@ -1262,6 +1269,32 @@ func (s *Store) recoverEcShardInterval(needleId types.NeedleId, ecVolume *erasur
 	copy(buf, shardIntervals[shardIdToRecover])
 
 	return len(buf), is_deleted, nil
+}
+
+// noteEcDegradedRead marks one reconstructed read: a counter by result, and at
+// V(1) a line binding it to the volume, its encode generation and the needle,
+// which the counter can't carry. available is how many shards were gathered,
+// against the DataShards the reconstruction needs.
+func noteEcDegradedRead(ecVolume *erasure_coding.EcVolume, needleId types.NeedleId, shardId erasure_coding.ShardId, available int, err error) {
+	result := "ok"
+	if err != nil {
+		result = "fail"
+	}
+	stats.VolumeServerECDegradedReadCounter.WithLabelValues(result).Inc()
+	if !glog.V(1) {
+		return
+	}
+	need := erasure_coding.DataShardsCount
+	if ecVolume.ECContext != nil {
+		need = ecVolume.ECContext.DataShards
+	}
+	if err != nil {
+		glog.Infof("ec degraded read: volume=%d generation=%d needle=%s shard=%d available=%d/%d result=%s error=%v",
+			ecVolume.VolumeId, ecVolume.EncodeTsNs, needleId, shardId, available, need, result, err)
+		return
+	}
+	glog.Infof("ec degraded read: volume=%d generation=%d needle=%s shard=%d available=%d/%d result=%s",
+		ecVolume.VolumeId, ecVolume.EncodeTsNs, needleId, shardId, available, need, result)
 }
 
 func (s *Store) EcVolumes() (ecVolumes []*erasure_coding.EcVolume) {
