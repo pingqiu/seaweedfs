@@ -277,6 +277,15 @@ func serveMountGrpc(wfs *mount.WFS, listener net.Listener) {
 	go grpcS.Serve(listener)
 }
 
+// closeMountSocket closes the mount's local gRPC listener and removes its socket
+// file, so an exited mount leaves nothing behind. Safe to call more than once.
+func closeMountSocket(listener net.Listener, path string) {
+	listener.Close()
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		glog.Warningf("remove mount socket %s: %v", path, err)
+	}
+}
+
 // resolveMountRoot trims the trailing slash the filer path must not carry.
 func resolveMountRoot(filerMountRootPath string) string {
 	mountRoot := filerMountRootPath

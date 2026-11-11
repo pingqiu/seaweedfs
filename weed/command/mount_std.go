@@ -69,6 +69,10 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 	if err != nil {
 		glog.Fatalf("Failed to listen on %s: %v", *option.localSocket, err)
 	}
+	// Remove the socket on every way out: a return here, or an interrupt (the hook
+	// runs after the unmount hook registered below, then the process exits).
+	defer closeMountSocket(montSocketListener, *option.localSocket)
+	grace.OnInterrupt(func() { closeMountSocket(montSocketListener, *option.localSocket) })
 
 	// detect mount folder mode
 	if *option.dirAutoCreate {
